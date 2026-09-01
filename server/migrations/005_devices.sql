@@ -1,0 +1,23 @@
+CREATE TABLE IF NOT EXISTS devices (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    device_id VARCHAR(128) UNIQUE NOT NULL,
+    name VARCHAR(255),
+    status VARCHAR(32) DEFAULT 'offline',
+    last_online TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS instance_sessions (
+    id SERIAL PRIMARY KEY,
+    instance_id BIGINT NOT NULL,
+    device_id VARCHAR(128) NOT NULL,
+    status VARCHAR(32) DEFAULT 'running',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS heartbeat_logs (
+    id SERIAL PRIMARY KEY,
+    device_id VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
