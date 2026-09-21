@@ -75,9 +75,19 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: frontend/package-lock.json
-      - run: go test ./...
+          cache-dependency-path: |
+            frontend/package-lock.json
+            desktop/vue3-ui/package-lock.json
+      # main.go and desktop/wails-client/main.go both use
+      # `//go:embed all:frontend/dist`, and neither dist directory is tracked.
+      # Both frontends must be built before any go command or the embed
+      # patterns match nothing and the packages fail to compile.
       - run: npm ci
         working-directory: frontend
       - run: npm run build
         working-directory: frontend
+      - run: npm ci
+        working-directory: desktop/vue3-ui
+      - run: npm run build
+        working-directory: desktop/vue3-ui
+      - run: go test ./...
