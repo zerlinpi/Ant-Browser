@@ -14,7 +14,7 @@ func (a *App) automationStatePayload() map[string]interface{} {
 	settings := map[string]interface{}{
 		"enabled":              false,
 		"installPolicy":        config.DefaultAutomationInstallPolicy,
-		"runtimeVersion":       config.DefaultAutomationRuntimeVersion(config.DefaultAutomationNodeVersion, config.DefaultAutomationPWVersion),
+		"runtimeVersion":       config.DefaultAutomationRuntimeVersion(config.DefaultAutomationNodeVersion, config.DefaultAutomationPWVersion, config.DefaultAutomationPuppeteerVersion),
 		"headlessDefault":      false,
 		"keepRuntimeOnDisable": true,
 		"allowTypeScriptBuild": false,
@@ -23,6 +23,7 @@ func (a *App) automationStatePayload() map[string]interface{} {
 		"systemNodePath":       "",
 		"nodeVersion":          config.DefaultAutomationNodeVersion,
 		"playwrightVersion":    config.DefaultAutomationPWVersion,
+		"puppeteerVersion":     config.DefaultAutomationPuppeteerVersion,
 	}
 	status := map[string]interface{}{
 		"installed":          false,
@@ -38,6 +39,7 @@ func (a *App) automationStatePayload() map[string]interface{} {
 		"systemNodeError":    "",
 		"nodeVersion":        config.DefaultAutomationNodeVersion,
 		"playwrightVersion":  config.DefaultAutomationPWVersion,
+		"puppeteerVersion":   config.DefaultAutomationPuppeteerVersion,
 	}
 
 	if a.config != nil {
@@ -52,6 +54,7 @@ func (a *App) automationStatePayload() map[string]interface{} {
 		settings["systemNodePath"] = a.config.Automation.SystemNodePath
 		settings["nodeVersion"] = a.config.Automation.NodeVersion
 		settings["playwrightVersion"] = a.config.Automation.PlaywrightCoreVersion
+		settings["puppeteerVersion"] = a.config.Automation.PuppeteerCoreVersion
 	}
 
 	if a.automationMgr != nil {
@@ -71,6 +74,7 @@ func (a *App) automationStatePayload() map[string]interface{} {
 			"systemNodeError":    state.SystemNodeError,
 			"nodeVersion":        state.NodeVersion,
 			"playwrightVersion":  state.PlaywrightVersion,
+			"puppeteerVersion":   state.PuppeteerVersion,
 		}
 	}
 
@@ -95,10 +99,14 @@ func applyAutomationConfigDefaults(auto *config.AutomationConfig) {
 	if strings.TrimSpace(auto.PlaywrightCoreVersion) == "" {
 		auto.PlaywrightCoreVersion = config.DefaultAutomationPWVersion
 	}
+	if strings.TrimSpace(auto.PuppeteerCoreVersion) == "" {
+		auto.PuppeteerCoreVersion = config.DefaultAutomationPuppeteerVersion
+	}
 	if strings.TrimSpace(auto.RuntimeVersion) == "" {
 		auto.RuntimeVersion = config.DefaultAutomationRuntimeVersion(
 			auto.NodeVersion,
 			auto.PlaywrightCoreVersion,
+			auto.PuppeteerCoreVersion,
 		)
 	}
 	if !auto.KeepRuntimeOnDisable {

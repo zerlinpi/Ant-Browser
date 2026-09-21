@@ -10,9 +10,10 @@ import (
 func (a *App) BrowserProxyBuildDiagnostic(proxyId string, proxyConfig string) ProxyBuildDiagnostic {
 	proxies := a.getLatestProxies()
 	return proxy.BuildProxyDiagnostic(proxyConfig, proxies, proxyId, proxy.BuildDiagnosticOptions{
-		XrayMgr:    a.xrayMgr,
-		SingBoxMgr: a.singboxMgr,
-		ClashMgr:   a.clashMgr,
+		XrayMgr:       a.xrayMgr,
+		SingBoxMgr:    a.singboxMgr,
+		ClashMgr:      a.clashMgr,
+		ConnectorType: a.defaultProxyConnectorType(),
 	})
 }
 

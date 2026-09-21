@@ -19,6 +19,25 @@ const (
 )
 
 func (m *Manager) RunScriptTask(ctx context.Context, req ScriptTaskRequest) (ScriptTaskResult, error) {
+	return m.runTask(ctx, req, nil)
+}
+
+func (m *Manager) RunWorkflowTask(ctx context.Context, req WorkflowTaskRequest) (ScriptTaskResult, error) {
+	var definition struct {
+		SchemaVersion string            `json:"schemaVersion"`
+		Engine        string            `json:"engine"`
+		Steps         []json.RawMessage `json:"steps"`
+	}
+	if len(req.Definition) > 512<<10 || json.Unmarshal(req.Definition, &definition) != nil || definition.SchemaVersion != "ant-workflow/v1" || (definition.Engine != "playwright" && definition.Engine != "puppeteer" && definition.Engine != "cdp") || len(definition.Steps) == 0 || len(definition.Steps) > 500 {
+		return ScriptTaskResult{}, fmt.Errorf("invalid or unsupported workflow definition")
+	}
+	if definition.Engine == "puppeteer" && m.CurrentState().PuppeteerVersion == "" {
+		return ScriptTaskResult{}, fmt.Errorf("puppeteer-core is not installed; upgrade the automation runtime")
+	}
+	return m.runTask(ctx, req.ScriptTaskRequest, req.Definition)
+}
+
+func (m *Manager) runTask(ctx context.Context, req ScriptTaskRequest, workflow json.RawMessage) (ScriptTaskResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -41,7 +60,7 @@ func (m *Manager) RunScriptTask(ctx context.Context, req ScriptTaskRequest) (Scr
 		return ScriptTaskResult{}, fmt.Errorf("taskKey is required")
 	}
 	req.ScriptPath = strings.TrimSpace(req.ScriptPath)
-	if req.ScriptPath == "" {
+	if req.ScriptPath == "" && len(workflow) == 0 {
 		return ScriptTaskResult{}, fmt.Errorf("scriptPath is required")
 	}
 	req.LaunchBaseURL = strings.TrimSpace(req.LaunchBaseURL)
@@ -59,6 +78,11 @@ func (m *Manager) RunScriptTask(ctx context.Context, req ScriptTaskRequest) (Scr
 		LaunchAuthHeader: strings.TrimSpace(req.LaunchAuthHeader),
 		LaunchAuthValue:  strings.TrimSpace(req.LaunchAuthValue),
 		ArtifactDir:      strings.TrimSpace(req.ArtifactDir),
+	}
+	if len(workflow) != 0 {
+		payload.TaskType = "workflow"
+		payload.Workflow = workflow
+		payload.ScriptPath = ""
 	}
 
 	taskID, runnerResp, rawOutput, durationMs, err := m.executeTask(
@@ -87,6 +111,7 @@ func (m *Manager) RunScriptTask(ctx context.Context, req ScriptTaskRequest) (Scr
 		RuntimeVersion:    state.RuntimeVersion,
 		NodeVersion:       state.NodeVersion,
 		PlaywrightVersion: state.PlaywrightVersion,
+		PuppeteerVersion:  state.PuppeteerVersion,
 	}
 	if result.Summary == "" {
 		if result.OK {
@@ -156,6 +181,9 @@ func (m *Manager) executeTask(ctx context.Context, taskKey string, payload taskR
 
 	state := m.CurrentState()
 	cmd := exec.CommandContext(ctx, state.NodePath, state.RunnerPath, payloadPath)
+	// Cloud device credentials must never enter user-script subprocesses.
+	cmd.Env = taskEnvironment(os.Environ())
+	cmd.Env = append(cmd.Env, "NODE_PATH="+filepath.Join(state.RuntimeDir, "node_modules"))
 	cmd.Dir = state.RuntimeDir
 	prepareTaskCommand(cmd)
 	cmd.Cancel = func() error {
@@ -265,4 +293,15 @@ func (m *Manager) writeTaskPayload(payload taskRunnerPayload) (string, error) {
 		return "", fmt.Errorf("写入自动化任务 payload 失败: %w", err)
 	}
 	return file.Name(), nil
+}
+
+func taskEnvironment(source []string) []string {
+	result := make([]string, 0, len(source))
+	for _, entry := range source {
+		key, _, _ := strings.Cut(entry, "=")
+		if !strings.EqualFold(key, "ANT_CLOUD_DEVICE_CREDENTIAL") {
+			result = append(result, entry)
+		}
+	}
+	return result
 }

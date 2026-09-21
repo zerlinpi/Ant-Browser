@@ -21,7 +21,7 @@ func runtimeInstallNodeMode(auto config.AutomationConfig) string {
 
 func (m *Manager) tryUseReadyRuntime(ctx context.Context, nodeMode string) (bool, error) {
 	state := m.CurrentState()
-	if !state.Ready {
+	if !state.Ready || state.PuppeteerVersion == "" {
 		return false, nil
 	}
 

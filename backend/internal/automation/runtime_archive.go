@@ -18,11 +18,12 @@ import (
 	"github.com/ulikunitz/xz"
 )
 
-func writeRuntimeManifest(path, nodeVersion, playwrightVersion, runtimeVersion, nodeSource, nodePath string) error {
+func writeRuntimeManifest(path, nodeVersion, playwrightVersion, puppeteerVersion, runtimeVersion, nodeSource, nodePath string) error {
 	payload := map[string]string{
 		"runtimeVersion":    strings.TrimSpace(runtimeVersion),
 		"nodeVersion":       strings.TrimSpace(nodeVersion),
 		"playwrightVersion": strings.TrimSpace(playwrightVersion),
+		"puppeteerVersion":  strings.TrimSpace(puppeteerVersion),
 		"nodeSource":        strings.TrimSpace(nodeSource),
 		"nodePath":          strings.TrimSpace(nodePath),
 		"installedAt":       time.Now().Format(time.RFC3339),

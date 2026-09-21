@@ -5,6 +5,10 @@ const SettingsPage = lazyNamed(
   () => import("../modules/settings/SettingsPage"),
   "SettingsPage",
 );
+const DashboardPage = lazyNamed(
+  () => import("../modules/dashboard/DashboardPage"),
+  "DashboardPage",
+);
 const ProfilePage = lazyNamed(
   () => import("../modules/profile/ProfilePage"),
   "ProfilePage",
@@ -69,7 +73,8 @@ const AutomationScriptDetailPage = lazyNamed(
 export function AppRoutes() {
   return (
     <Routes>
-      <Route path="/" element={<Navigate to="/browser/list" replace />} />
+      <Route path="/" element={<Navigate to="/dashboard" replace />} />
+      <Route path="/dashboard" element={<DashboardPage />} />
       <Route path="/charts" element={<ChartsPage />} />
       <Route path="/settings" element={<SettingsPage />} />
       <Route path="/profile" element={<ProfilePage />} />

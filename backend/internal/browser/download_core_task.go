@@ -96,36 +96,53 @@ func (m *Manager) downloadAndExtractCore(ctx context.Context, coreInput CoreInpu
 		return
 	}
 
-	// 2. 准备 HttpClient（优先从 Windows 注册表读取真实系统代理，而非仅靠环境变量）
-	transport := &http.Transport{}
-	if proxyConfig == "__system__" {
-		// http.ProxyFromEnvironment 只读环境变量，而 Clash 的全局代理写在 Windows 注册表里
-		// 必须直接读取注册表才能拿到正确的代理地址
-		if sysProxy, rErr := readSystemProxy(); rErr == nil && sysProxy != "" {
-			if proxyURL, pErr := url.Parse(sysProxy); pErr == nil {
-				transport.Proxy = http.ProxyURL(proxyURL)
-				sendEvent("downloading", 0, "已从系统注册表读取代理: "+sysProxy)
-			} else {
-				// 解析失败则回退到环境变量
-				transport.Proxy = http.ProxyFromEnvironment
-			}
-		} else {
-			// 没有系统代理配置或读取失败，尝试环境变量兜底
-			transport.Proxy = http.ProxyFromEnvironment
-			sendEvent("downloading", 0, "系统注册表无代理配置，使用环境变量兜底")
-		}
-	} else if proxyConfig != "" && proxyConfig != "direct://" && proxyConfig != "__direct__" {
-		if proxyURL, pErr := url.Parse(proxyConfig); pErr == nil {
-			transport.Proxy = http.ProxyURL(proxyURL)
-		} else {
-			sendEvent("error", 0, "代理地址解析失败: "+pErr.Error())
+	// 2. 准备 HttpClient。Wails 注入的客户端已经按当前 connector stack
+	// 构建；__system__ 保留平台特定的旧传输路径。
+	var client *http.Client
+	if m.DownloadHTTPClient != nil && proxyConfig != "__system__" {
+		var clientErr error
+		client, clientErr = m.DownloadHTTPClient(proxyConfig)
+		if clientErr != nil {
+			sendEvent("error", 0, "代理连接栈不可用: "+clientErr.Error())
 			return
 		}
-	}
-
-	client := &http.Client{
-		Timeout:   0, // 取消全局超时，依靠 context 和分片连接维持
-		Transport: transport,
+		if client == nil {
+			sendEvent("error", 0, "代理连接栈返回空 HTTP 客户端")
+			return
+		}
+		client.Timeout = 0
+	} else {
+		// Legacy standalone/system transport.
+		transport := &http.Transport{}
+		if proxyConfig == "__system__" {
+			// http.ProxyFromEnvironment 只读环境变量，而 Clash 的全局代理写在 Windows 注册表里
+			// 必须直接读取注册表才能拿到正确的代理地址
+			if sysProxy, rErr := readSystemProxy(); rErr == nil && sysProxy != "" {
+				if proxyURL, pErr := url.Parse(sysProxy); pErr == nil {
+					transport.Proxy = http.ProxyURL(proxyURL)
+					sendEvent("downloading", 0, "已从系统注册表读取代理: "+sysProxy)
+				} else {
+					// 解析失败则回退到环境变量
+					transport.Proxy = http.ProxyFromEnvironment
+				}
+			} else {
+				// 没有系统代理配置或读取失败，尝试环境变量兜底
+				transport.Proxy = http.ProxyFromEnvironment
+				sendEvent("downloading", 0, "系统注册表无代理配置，使用环境变量兜底")
+			}
+		} else if proxyConfig != "" && proxyConfig != "direct://" && proxyConfig != "__direct__" {
+			if proxyURL, pErr := url.Parse(proxyConfig); pErr == nil {
+				transport.Proxy = http.ProxyURL(proxyURL)
+			} else {
+				sendEvent("error", 0, "代理地址解析失败: "+pErr.Error())
+				return
+			}
+		}
+		client = &http.Client{
+			Timeout:   0, // 取消全局超时，依靠 context 和分片连接维持
+			Transport: transport,
+		}
+		client.Transport = transport
 	}
 
 	tempFile, err := os.CreateTemp(parentDir, coreArchiveTempPattern(targetUrl))

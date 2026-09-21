@@ -1,0 +1,20 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "Ant Browser Cloud",
+  "outputfilename": "ant-browser-cloud",
+  "frontend:install": "npm --prefix ../../vue3-ui install",
+  "frontend:build": "npm --prefix ../../vue3-ui run build",
+  "frontend:dev:watcher": "npm --prefix ../../vue3-ui run dev",
+  "frontend:dev:serverUrl": "auto",
+  "wailsjsdir": "../vue3-ui/src/wailsjs",
+  "author": {
+    "name": "Ant Browser Team",
+    "email": "contact@antblack.de"
+  },
+  "info": {
+    "companyName": "Ant Browser",
+    "productName": "Ant Browser Cloud",
+    "productVersion": "2.0.0",
+    "copyright": "Copyright © 2026"
+  }
+}

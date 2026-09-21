@@ -111,7 +111,7 @@ func (a *App) warmupProxyBridge(proxyId string, proxyConfig string, proxies []Br
 		return result
 	}
 
-	resolution, err := proxy.ResolveProxyKernel(src, proxies, proxyId, "")
+	resolution, err := proxy.ResolveProxyKernelForConnector(src, proxies, proxyId, a.defaultProxyConnectorType())
 	result.Engine = resolution.Kernel
 	if err != nil {
 		result.Error = err.Error()

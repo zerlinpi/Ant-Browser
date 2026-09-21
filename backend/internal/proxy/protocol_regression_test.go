@@ -1,6 +1,9 @@
 package proxy
 
-import "testing"
+import (
+	"ant-chrome/backend/internal/config"
+	"testing"
+)
 
 func TestVlessRealityURIUsesRealitySettings(t *testing.T) {
 	src := "vless://00000000-0000-0000-0000-000000000001@reality.example.com:443?security=reality&sni=sni.example.com&fp=chrome&pbk=public-key-1&sid=abcd&spx=%2F&type=tcp&flow=xtls-rprx-vision#Reality"
@@ -212,5 +215,29 @@ public-key: public
 	}
 	if diagnostic.Outbound["type"] != "wireguard" {
 		t.Fatalf("WireGuard diagnostic outbound = %#v", diagnostic.Outbound)
+	}
+}
+
+func TestDiagnosticsHonorConfiguredConnectorStack(t *testing.T) {
+	vless := `
+name: vless-node
+type: vless
+server: example.com
+port: 443
+uuid: 00000000-0000-0000-0000-000000000000
+`
+	diagnostic := BuildProxyDiagnostic(vless, nil, "", BuildDiagnosticOptions{
+		ConnectorType: config.BrowserConnectorMihomo,
+	})
+	if !diagnostic.Ok || diagnostic.Engine != ProxyKernelMihomo {
+		t.Fatalf("mihomo connector diagnostic = %+v, want ok mihomo", diagnostic)
+	}
+
+	hysteria := "hysteria2://pass@example.com:443"
+	diagnostic = BuildProxyDiagnostic(hysteria, nil, "", BuildDiagnosticOptions{
+		ConnectorType: config.BrowserConnectorXray,
+	})
+	if !diagnostic.Ok || diagnostic.Engine != ProxyKernelSingBox {
+		t.Fatalf("xray-combination diagnostic = %+v, want ok sing-box", diagnostic)
 	}
 }

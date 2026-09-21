@@ -120,5 +120,6 @@ func (a *App) AutomationRuntimeSelfCheck() (map[string]interface{}, error) {
 		"nodeSource":        result.NodeSource,
 		"nodeVersion":       result.NodeVersion,
 		"playwrightVersion": result.PlaywrightVersion,
+		"puppeteerVersion":  result.PuppeteerVersion,
 	}, nil
 }

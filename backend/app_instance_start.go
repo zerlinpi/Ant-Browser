@@ -1,5 +1,7 @@
 package backend
 
+import "context"
+
 func (a *App) BrowserInstanceStart(profileId string) (*BrowserProfile, error) {
 	return a.browserInstanceStartInternal(profileId, nil, nil, false, false, false, "", "")
 }
@@ -20,9 +22,16 @@ func (a *App) BrowserInstanceStartWithParams(profileId string, extraLaunchArgs [
 }
 
 func (a *App) browserInstanceStartInternal(profileId string, extraLaunchArgs []string, startURLs []string, skipDefaultStartURLs bool, preferVisibleWindow bool, forceDirectProxy bool, proxyId string, proxyConfig string) (*BrowserProfile, error) {
+	return a.browserInstanceStartInternalContext(context.Background(), profileId, extraLaunchArgs, startURLs, skipDefaultStartURLs, preferVisibleWindow, forceDirectProxy, proxyId, proxyConfig)
+}
+
+func (a *App) browserInstanceStartInternalContext(ctx context.Context, profileId string, extraLaunchArgs []string, startURLs []string, skipDefaultStartURLs bool, preferVisibleWindow bool, forceDirectProxy bool, proxyId string, proxyConfig string) (*BrowserProfile, error) {
 	input := newBrowserStartInput(profileId, extraLaunchArgs, startURLs, skipDefaultStartURLs, preferVisibleWindow, forceDirectProxy, proxyId, proxyConfig)
 	a.browserMgr.Mutex.Lock()
 	defer a.browserMgr.Mutex.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	profile, handled, err := a.resolveBrowserStartProfile(input)
 	if err != nil || handled {
@@ -38,6 +47,9 @@ func (a *App) browserInstanceStartInternal(profileId string, extraLaunchArgs []s
 		return profile, err
 	}
 	defer plan.releaseBridgeIfNeeded(a)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	return a.startBrowserProfileWithPlan(input, plan)
 }

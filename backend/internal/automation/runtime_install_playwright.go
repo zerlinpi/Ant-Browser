@@ -38,6 +38,7 @@ func (m *Manager) activateRuntimeInstall(stagingDir string, auto config.Automati
 		filepath.Join(stagingDir, "manifest.json"),
 		nodeVersion,
 		auto.PlaywrightCoreVersion,
+		auto.PuppeteerCoreVersion,
 		auto.RuntimeVersion,
 		nodeSource,
 		nodePath,

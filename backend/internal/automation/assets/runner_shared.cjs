@@ -39,9 +39,14 @@ function writeStream(stream, text) {
 }
 
 async function closeBrowserConnection(browser) {
-  if (!browser || typeof browser.close !== 'function') {
+  if (!browser) {
     return;
   }
+  if (typeof browser.disconnect === 'function') {
+    browser.disconnect();
+    return;
+  }
+  if (typeof browser.close !== 'function') return;
   await browser.close({ reason: 'automation task finished' }).catch(() => {});
 }
 

@@ -58,7 +58,11 @@ publish/staging/
 publish/output/
 
 # Internal docs / scratch files
-docs/
+!docs/
+docs/*
+!docs/cloud-deployment.md
+!docs/security.md
+!docs/proxy-connector-stacks.md
 DEPLOYMENT_GUIDE.md
 plan.md
 pic/
@@ -76,9 +80,10 @@ proxies.yaml
 profiles.yaml
 
 # Frontend deps/cache
-frontend/node_modules/
+node_modules/
 frontend/dist/
 frontend/.vite/
+desktop/wails-client/frontend/dist/
 
 # Python cache
 __pycache__/
@@ -86,6 +91,7 @@ __pycache__/
 
 # Local runtime cache
 .tmp/runtime-cache/
+.codex-tmp/
 
 # Test outputs / coverage
 coverage/

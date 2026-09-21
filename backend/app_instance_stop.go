@@ -2,14 +2,22 @@ package backend
 
 import (
 	"ant-chrome/backend/internal/logger"
+	"context"
 	"fmt"
 	"time"
 )
 
 func (a *App) BrowserInstanceStop(profileId string) (*BrowserProfile, error) {
+	return a.browserInstanceStopContext(context.Background(), profileId)
+}
+
+func (a *App) browserInstanceStopContext(ctx context.Context, profileId string) (*BrowserProfile, error) {
 	log := logger.New("Browser")
 	a.browserMgr.Mutex.Lock()
 	defer a.browserMgr.Mutex.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	profile, exists := a.browserMgr.Profiles[profileId]
 	if !exists {

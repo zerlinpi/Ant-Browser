@@ -181,7 +181,8 @@ func normalizeConfig(config *Config) {
 		strings.TrimSpace(config.Automation.NodeSource) == "" &&
 		strings.TrimSpace(config.Automation.SystemNodePath) == "" &&
 		strings.TrimSpace(config.Automation.NodeVersion) == "" &&
-		strings.TrimSpace(config.Automation.PlaywrightCoreVersion) == ""
+		strings.TrimSpace(config.Automation.PlaywrightCoreVersion) == "" &&
+		strings.TrimSpace(config.Automation.PuppeteerCoreVersion) == ""
 	if automationUnset {
 		config.Automation = defaultConfig.Automation
 	} else {
@@ -194,6 +195,9 @@ func normalizeConfig(config *Config) {
 		if strings.TrimSpace(config.Automation.PlaywrightCoreVersion) == "" {
 			config.Automation.PlaywrightCoreVersion = defaultConfig.Automation.PlaywrightCoreVersion
 		}
+		if strings.TrimSpace(config.Automation.PuppeteerCoreVersion) == "" {
+			config.Automation.PuppeteerCoreVersion = defaultConfig.Automation.PuppeteerCoreVersion
+		}
 		if strings.TrimSpace(config.Automation.ArtifactsDir) == "" {
 			config.Automation.ArtifactsDir = defaultConfig.Automation.ArtifactsDir
 		} else {
@@ -205,6 +209,7 @@ func normalizeConfig(config *Config) {
 			config.Automation.RuntimeVersion = DefaultAutomationRuntimeVersion(
 				config.Automation.NodeVersion,
 				config.Automation.PlaywrightCoreVersion,
+				config.Automation.PuppeteerCoreVersion,
 			)
 		}
 	}
@@ -305,7 +310,7 @@ func DefaultConfig() *Config {
 		Automation: AutomationConfig{
 			Enabled:               false,
 			InstallPolicy:         DefaultAutomationInstallPolicy,
-			RuntimeVersion:        DefaultAutomationRuntimeVersion(DefaultAutomationNodeVersion, DefaultAutomationPWVersion),
+			RuntimeVersion:        DefaultAutomationRuntimeVersion(DefaultAutomationNodeVersion, DefaultAutomationPWVersion, DefaultAutomationPuppeteerVersion),
 			HeadlessDefault:       false,
 			KeepRuntimeOnDisable:  true,
 			AllowTypeScriptBuild:  false,
@@ -314,6 +319,7 @@ func DefaultConfig() *Config {
 			SystemNodePath:        "",
 			NodeVersion:           DefaultAutomationNodeVersion,
 			PlaywrightCoreVersion: DefaultAutomationPWVersion,
+			PuppeteerCoreVersion:  DefaultAutomationPuppeteerVersion,
 		},
 	}
 }
@@ -376,8 +382,17 @@ func containsFingerprintArg(args []string, expected string) bool {
 	}
 	return false
 }
-func DefaultAutomationRuntimeVersion(nodeVersion, playwrightVersion string) string {
-	return fmt.Sprintf("node-%s-playwright-core-%s", strings.TrimSpace(nodeVersion), strings.TrimSpace(playwrightVersion))
+func DefaultAutomationRuntimeVersion(nodeVersion, playwrightVersion string, puppeteerVersion ...string) string {
+	resolvedPuppeteerVersion := DefaultAutomationPuppeteerVersion
+	if len(puppeteerVersion) > 0 && strings.TrimSpace(puppeteerVersion[0]) != "" {
+		resolvedPuppeteerVersion = strings.TrimSpace(puppeteerVersion[0])
+	}
+	return fmt.Sprintf(
+		"node-%s-playwright-core-%s-puppeteer-core-%s",
+		strings.TrimSpace(nodeVersion),
+		strings.TrimSpace(playwrightVersion),
+		resolvedPuppeteerVersion,
+	)
 }
 
 func normalizeAutomationNodeSource(value string) string {

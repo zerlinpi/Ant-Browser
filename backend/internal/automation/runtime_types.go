@@ -42,6 +42,7 @@ type RuntimeState struct {
 	RunnerPath           string `json:"runnerPath"`
 	NodeVersion          string `json:"nodeVersion"`
 	PlaywrightVersion    string `json:"playwrightVersion"`
+	PuppeteerVersion     string `json:"puppeteerVersion"`
 }
 
 type RuntimeCheckResult struct {
@@ -49,6 +50,7 @@ type RuntimeCheckResult struct {
 	NodeSource        string `json:"nodeSource"`
 	NodeVersion       string `json:"nodeVersion"`
 	PlaywrightVersion string `json:"playwrightVersion"`
+	PuppeteerVersion  string `json:"puppeteerVersion"`
 }
 
 type Options struct {
@@ -142,6 +144,7 @@ func (m *Manager) CurrentState() RuntimeState {
 	runtimeDir := m.runtimeDir(auto.RuntimeVersion)
 	runnerPath := m.runnerScriptPath(runtimeDir)
 	playwrightPkgPath := filepath.Join(runtimeDir, "node_modules", "playwright-core", "package.json")
+	puppeteerPkgPath := filepath.Join(runtimeDir, "node_modules", "puppeteer-core", "package.json")
 	resolvedNode := m.resolveNodeRuntime(runtimeDir, auto)
 	nodePath := strings.TrimSpace(resolvedNode.Path)
 	installed := fileExists(nodePath) && fileExists(playwrightPkgPath) && fileExists(runnerPath)
@@ -151,9 +154,13 @@ func (m *Manager) CurrentState() RuntimeState {
 		nodeVersion = resolvedNode.Version
 	}
 	playwrightVersion := strings.TrimSpace(auto.PlaywrightCoreVersion)
+	puppeteerVersion := readPackageVersion(puppeteerPkgPath)
 	if installed {
 		if detected := readPackageVersion(playwrightPkgPath); detected != "" {
 			playwrightVersion = detected
+		}
+		if detected := readPackageVersion(puppeteerPkgPath); detected != "" {
+			puppeteerVersion = detected
 		}
 	}
 
@@ -177,6 +184,7 @@ func (m *Manager) CurrentState() RuntimeState {
 		RunnerPath:           runnerPath,
 		NodeVersion:          nodeVersion,
 		PlaywrightVersion:    playwrightVersion,
+		PuppeteerVersion:     puppeteerVersion,
 	}
 }
 

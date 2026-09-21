@@ -133,7 +133,7 @@ func isSupportedLocalImportFile(filePath string) bool {
 
 func isAllowedRuntimeModule(specifier string) bool {
 	switch strings.TrimSpace(specifier) {
-	case "playwright", "playwright-core":
+	case "playwright", "playwright-core", "puppeteer-core":
 		return true
 	}
 

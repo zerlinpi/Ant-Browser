@@ -11,6 +11,7 @@ import (
 	"ant-chrome/backend/internal/proxy"
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -55,6 +56,8 @@ func (a *App) startup(ctx context.Context) {
 	a.startupInitAutomation()
 	a.startupInitBridgeHooks()
 	a.startupInitSpeedScheduler()
+	a.startupInitCloudWorkflows(log)
+	a.startupInitCloudCommands(log)
 
 	log.Info("应用启动成功")
 }
@@ -124,6 +127,12 @@ func (a *App) startupInitManagers(cfg *config.Config, db *database.DB) {
 	a.xrayMgr = proxy.NewXrayManager(cfg, a.appRoot)
 	a.clashMgr = proxy.NewClashManager(cfg, a.appRoot)
 	a.singboxMgr = proxy.NewSingBoxManager(cfg, a.appRoot)
+	// Browser-core downloads must follow the configured connector stack.  The
+	// callback is injected at the backend boundary to avoid a package cycle;
+	// the browser package retains its legacy transport when used standalone.
+	a.browserMgr.DownloadHTTPClient = func(proxyConfig string) (*http.Client, error) {
+		return a.buildBrowserCoreDownloadHTTPClient(proxyConfig)
+	}
 
 	conn := db.GetConn()
 	a.browserMgr.ProfileDAO = browser.NewSQLiteProfileDAO(conn)

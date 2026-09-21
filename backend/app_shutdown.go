@@ -11,6 +11,8 @@ import (
 )
 
 func (a *App) shutdown(ctx context.Context) {
+	a.stopCloudCommands()
+	a.stopCloudWorkflows()
 	log := logger.New("App")
 	if a.shouldStopRuntimeServicesOnShutdown() {
 		log.Info("应用正在关闭...")
@@ -80,6 +82,8 @@ func ShouldBlockClose(a *App, ctx context.Context) bool {
 
 func (a *App) stopRuntimeServices() {
 	a.stopServicesOnce.Do(func() {
+		a.stopCloudWorkflows()
+		a.stopCloudCommands()
 		if a.automationMgr != nil {
 			a.automationMgr.StopAllTasks()
 		}

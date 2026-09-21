@@ -1,0 +1,16 @@
+# Overlay on docker-compose.yml. Bind paths are resolved relative to that file.
+services:
+  worker:
+    environment:
+      ANT_PROXY_PROBE_EXECUTABLE: /app/proxy-probe
+      ANT_PROXY_RUNTIME_CONFIG: /etc/ant/proxy-runtime.yml
+      ANT_PROXY_RUNTIME_ROOT: /var/lib/ant-proxy
+      ANT_PROXY_PROBE_TARGET: ${PROXY_PROBE_TARGET:?set HTTPS IP echo endpoint}
+      ANT_SECRET_MASTER_KEY: ${SECRET_MASTER_KEY:?set SECRET_MASTER_KEY}
+      ANT_SECRET_KEY_VERSION: ${SECRET_KEY_VERSION:-v1}
+    volumes:
+      - ../production/proxy-runtime.yml:/etc/ant/proxy-runtime.yml:ro
+      - ${PROXY_CONNECTOR_DIR:?set absolute connector directory}:/opt/ant-connectors:ro
+    tmpfs:
+      - /var/lib/ant-proxy:uid=65532,gid=65532,mode=0700,size=256m
+    init: true

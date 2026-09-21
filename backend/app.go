@@ -46,6 +46,12 @@ type App struct {
 	deferredStartTargets   map[string]deferredStartTargetsPlan
 	automationTargetMu     sync.Mutex
 	automationTargetCursor map[string]string
+	cloudWorkflowMu        sync.Mutex
+	cloudWorkflowCancel    context.CancelFunc
+	cloudWorkflowDone      chan struct{}
+	cloudCommandMu         sync.Mutex
+	cloudCommandCancel     context.CancelFunc
+	cloudCommandDone       chan struct{}
 	stopServicesOnce       sync.Once
 	finalizeOnce           sync.Once
 }

@@ -12,6 +12,7 @@ const {
 } = require('./runner_shared.cjs');
 const { normalizeOrigin, normalizePermissionList, normalizePageAPIRequest, executePageAPIRequest } = require('./runner_page_api.cjs');
 const { loadScriptModule } = require('./runner_script_loader.cjs');
+const { runWorkflow, validateWorkflow } = require('./runner_workflow.cjs');
 
 const ALLOWED_WAIT_UNTIL = new Set(['load', 'domcontentloaded', 'networkidle', 'commit']);
 
@@ -110,8 +111,10 @@ function buildLaunchRequestBody(defaultSelector, options) {
   return body;
 }
 
-async function runScriptTask(payload, chromium) {
-  const scriptModule = await loadScriptModule(payload.scriptPath);
+async function runScriptTask(payload, chromium, puppeteer) {
+  const scriptModule = payload.taskType === 'workflow'
+    ? { run: (api) => runWorkflow(payload.workflow, api) }
+    : await loadScriptModule(payload.scriptPath);
   if (!scriptModule || typeof scriptModule.run !== 'function') {
     throw new Error('script must export run()');
   }
@@ -177,6 +180,8 @@ async function runScriptTask(payload, chromium) {
     }
 
     const connectTimeout = normalizeTimeout(connectOptions.timeoutMs, timeout);
+    const engine = String(connectOptions.engine || 'playwright').trim().toLowerCase();
+    if (!['playwright', 'puppeteer', 'cdp'].includes(engine)) throw new Error('workflow_engine_unavailable');
     const deadline = Date.now() + connectTimeout;
     let lastError = null;
 
@@ -188,16 +193,29 @@ async function runScriptTask(payload, chromium) {
         }
 
         try {
-          const browser = await chromium.connectOverCDP(endpoint, {
-            timeout: Math.max(1000, Math.min(remaining, connectTimeout)),
-          });
+          const browser = engine === 'puppeteer'
+            ? await puppeteer.connect({
+                ...(endpoint.startsWith('ws:') || endpoint.startsWith('wss:')
+                  ? { browserWSEndpoint: endpoint }
+                  : { browserURL: endpoint }),
+                protocolTimeout: Math.max(1000, Math.min(remaining, connectTimeout)),
+              })
+            : await chromium.connectOverCDP(endpoint, {
+                timeout: Math.max(1000, Math.min(remaining, connectTimeout)),
+              });
           connectedBrowsers.add(browser);
-          const context = browser.contexts()[0] || null;
-          const page = context && context.pages().length > 0 ? context.pages()[0] : null;
+          const context = engine === 'puppeteer'
+            ? (browser.browserContexts()[0] || browser.defaultBrowserContext())
+            : (browser.contexts()[0] || null);
+          const pages = engine === 'puppeteer'
+            ? await browser.pages()
+            : (context ? context.pages() : []);
+          const page = pages.length > 0 ? pages[0] : null;
           return {
             browser,
             context,
             page,
+            engine,
             session: {
               ...session,
               cdpUrl: endpoint,
@@ -230,7 +248,9 @@ async function runScriptTask(payload, chromium) {
 
     const context =
       connection.context ||
-      browser.contexts()[0] ||
+      (typeof browser.contexts === 'function' ? browser.contexts()[0] : null) ||
+      (typeof browser.browserContexts === 'function' ? browser.browserContexts()[0] : null) ||
+      (typeof browser.defaultBrowserContext === 'function' ? browser.defaultBrowserContext() : null) ||
       (typeof browser.newContext === 'function' ? await browser.newContext() : null);
     if (!context) {
       throw new Error('browser context is unavailable');
@@ -283,7 +303,12 @@ async function runScriptTask(payload, chromium) {
         reason: 'permissions are required',
       };
     }
-    if (typeof context.grantPermissions !== 'function') {
+    const grant = typeof context.grantPermissions === 'function'
+      ? () => context.grantPermissions(permissions, { origin })
+      : typeof context.overridePermissions === 'function'
+        ? () => context.overridePermissions(origin, permissions)
+        : null;
+    if (!grant) {
       return {
         applied: false,
         permissions,
@@ -293,12 +318,12 @@ async function runScriptTask(payload, chromium) {
     }
 
     try {
-      await context.grantPermissions(permissions, { origin });
+      await grant();
       return {
         applied: true,
         permissions,
         origin,
-        strategy: 'grantPermissions',
+            strategy: typeof context.grantPermissions === 'function' ? 'grantPermissions' : 'overridePermissions',
       };
     } catch (error) {
       return {
@@ -360,8 +385,11 @@ async function runScriptTask(payload, chromium) {
       const waitUntil = ALLOWED_WAIT_UNTIL.has(String(openOptions.waitUntil || '').trim())
         ? String(openOptions.waitUntil).trim()
         : 'domcontentloaded';
+      const engineWaitUntil = connection && connection.engine === 'puppeteer'
+        ? (waitUntil === 'networkidle' ? 'networkidle0' : waitUntil === 'commit' ? 'domcontentloaded' : waitUntil)
+        : waitUntil;
       await page.goto(targetURL, {
-        waitUntil,
+        waitUntil: engineWaitUntil,
         timeout: normalizeTimeout(openOptions.timeoutMs, timeout),
       });
     }
@@ -413,7 +441,7 @@ async function runScriptTask(payload, chromium) {
     const connectOptions =
       runOptions.connect && typeof runOptions.connect === 'object' && !Array.isArray(runOptions.connect)
         ? runOptions.connect
-        : {};
+        : runOptions;
     const openOptions =
       runOptions.open && typeof runOptions.open === 'object' && !Array.isArray(runOptions.open)
         ? runOptions.open
@@ -446,12 +474,14 @@ async function runScriptTask(payload, chromium) {
     return {
       session,
       connection,
+      engine: connection.engine,
       ...opened,
     };
   };
 
   const api = {
     chromium,
+    puppeteer,
     launch,
     connect,
     grantPermissions,
@@ -541,12 +571,22 @@ async function main() {
   }
 
   const { chromium } = require(path.join(runtimeDir, 'node_modules', 'playwright-core'));
+  // Existing Playwright-only installations remain usable until explicitly
+  // upgraded. Resolve Puppeteer only when that engine is requested.
+  const puppeteer = {
+    connect: async options => {
+      const library = require(path.join(runtimeDir, 'node_modules', 'puppeteer-core'));
+      return library.connect(options);
+    },
+  };
   const taskType = String(payload.taskType || 'script').trim() || 'script';
-  if (taskType !== 'script') {
+  if (taskType !== 'script' && taskType !== 'workflow') {
     throw new Error(`unsupported automation task type: ${taskType}`);
   }
 
-  const result = await runScriptTask(payload, chromium);
+  if (taskType === 'workflow') validateWorkflow(payload.workflow);
+
+  const result = await runScriptTask(payload, chromium, puppeteer);
   await writeStream(process.stdout, JSON.stringify(result));
   process.exit(0);
 }

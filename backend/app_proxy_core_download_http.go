@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"ant-chrome/backend/internal/proxy"
 	xproxy "golang.org/x/net/proxy"
 )
 
@@ -29,7 +30,7 @@ type githubReleaseAsset struct {
 
 func proxyCoreHTTPClient(timeout time.Duration, proxyConfig string) (*http.Client, string, error) {
 	proxyConfig = strings.TrimSpace(proxyConfig)
-	if proxyConfig == "" || strings.EqualFold(proxyConfig, "direct://") {
+	if proxyConfig == "" || strings.EqualFold(proxyConfig, "direct://") || strings.EqualFold(proxyConfig, "__direct__") {
 		return &http.Client{Timeout: timeout, Transport: proxyCoreDirectTransport()}, "直连", nil
 	}
 	u, err := url.Parse(proxyConfig)
@@ -61,6 +62,75 @@ func proxyCoreHTTPClient(timeout time.Duration, proxyConfig string) (*http.Clien
 	default:
 		return nil, "", fmt.Errorf("仅支持 http://、https://、socks5:// 或 direct://")
 	}
+}
+
+// buildProxyCoreDownloadHTTPClient selects the configured connector for
+// advanced proxy protocols.  Bootstrap downloads still support direct/http/
+// socks5 without a runtime bridge; advanced protocols require their connector
+// binary to already exist, so a missing binary is returned as an explicit
+// error rather than silently falling back to another stack.
+func (a *App) buildProxyCoreDownloadHTTPClient(timeout time.Duration, proxyConfig string) (*http.Client, string, error) {
+	proxyConfig = strings.TrimSpace(proxyConfig)
+	if proxyConfig == "" || strings.EqualFold(proxyConfig, "direct://") || strings.EqualFold(proxyConfig, "__direct__") {
+		client, label, err := proxyCoreHTTPClient(timeout, proxyConfig)
+		return client, label, err
+	}
+	if a == nil || a.config == nil {
+		return nil, "", fmt.Errorf("proxy core bootstrap requires initialized connector configuration")
+	}
+	connectorType := a.defaultProxyConnectorType()
+	proxies := a.config.Browser.Proxies
+	if a.browserMgr != nil {
+		proxies = a.getLatestProxies()
+	}
+	client, err := proxy.BuildProxyHTTPClient(
+		proxyConfig,
+		"",
+		proxies,
+		a.xrayMgr,
+		a.singboxMgr,
+		a.clashMgr,
+		connectorType,
+		timeout,
+	)
+	if err != nil {
+		return nil, connectorType + " connector stack", fmt.Errorf("proxy core bootstrap requires an installed %s connector: %w", connectorType, err)
+	}
+	return client, connectorType + " connector stack", nil
+}
+
+// buildBrowserCoreDownloadHTTPClient is injected into browser.Manager so the
+// ordinary Chromium-core downloader follows the same connector selection as
+// instance launch. __system__ is intentionally left to the Manager's legacy
+// platform-specific transport because it is not a connector stack.
+func (a *App) buildBrowserCoreDownloadHTTPClient(proxyConfig string) (*http.Client, error) {
+	proxyConfig = strings.TrimSpace(proxyConfig)
+	if proxyConfig == "" || strings.EqualFold(proxyConfig, "direct://") || strings.EqualFold(proxyConfig, "__direct__") {
+		client, _, err := proxyCoreHTTPClient(0, proxyConfig)
+		return client, err
+	}
+	if a == nil || a.config == nil {
+		return nil, fmt.Errorf("browser core download requires initialized connector configuration")
+	}
+	connectorType := a.defaultProxyConnectorType()
+	proxies := a.config.Browser.Proxies
+	if a.browserMgr != nil {
+		proxies = a.getLatestProxies()
+	}
+	client, err := proxy.BuildProxyHTTPClient(
+		proxyConfig,
+		"",
+		proxies,
+		a.xrayMgr,
+		a.singboxMgr,
+		a.clashMgr,
+		connectorType,
+		0,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("browser core download requires an installed %s connector: %w", connectorType, err)
+	}
+	return client, nil
 }
 
 func proxyCoreDirectTransport() *http.Transport {

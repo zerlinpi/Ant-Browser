@@ -1,0 +1,5 @@
+browser:
+  xray_binary_path: /opt/ant-connectors/xray
+  singbox_binary_path: /opt/ant-connectors/sing-box
+  clash_binary_path: /opt/ant-connectors/mihomo
+  default_connector_type: xray

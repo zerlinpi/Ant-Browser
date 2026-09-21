@@ -51,10 +51,11 @@ launch_server:
 automation:
   enabled: false
   install_policy: on_demand
-  runtime_version: node-22.15.1-playwright-core-1.59.0
+  runtime_version: node-22.15.1-playwright-core-1.59.0-puppeteer-core-25.11.0
   headless_default: false
   keep_runtime_on_disable: true
   node_source: auto
   system_node_path: ""
   node_version: 22.15.1
   playwright_core_version: 1.59.0
+  puppeteer_core_version: 25.11.0

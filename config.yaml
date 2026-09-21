@@ -65,9 +65,10 @@ launch_server:
 automation:
     enabled: true
     install_policy: on_demand
-    runtime_version: node-22.15.1-playwright-core-1.59.0
+    runtime_version: node-22.15.1-playwright-core-1.59.0-puppeteer-core-25.11.0
     keep_runtime_on_disable: true
     artifacts_dir: data/automation/artifacts
     node_source: auto
     node_version: 22.15.1
     playwright_core_version: 1.59.0
+    puppeteer_core_version: 25.11.0

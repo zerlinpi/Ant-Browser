@@ -1,12 +1,13 @@
 package config
 
 const (
-	DefaultLaunchServerPort         = 19876
-	DefaultLaunchServerAPIKeyHeader = "X-Ant-Api-Key"
-	DefaultAutomationInstallPolicy  = "on_demand"
-	DefaultAutomationNodeSource     = "auto"
-	DefaultAutomationNodeVersion    = "22.15.1"
-	DefaultAutomationPWVersion      = "1.59.0"
+	DefaultLaunchServerPort           = 19876
+	DefaultLaunchServerAPIKeyHeader   = "X-Ant-Api-Key"
+	DefaultAutomationInstallPolicy    = "on_demand"
+	DefaultAutomationNodeSource       = "auto"
+	DefaultAutomationNodeVersion      = "22.15.1"
+	DefaultAutomationPWVersion        = "1.59.0"
+	DefaultAutomationPuppeteerVersion = "25.11.0"
 )
 
 const (
@@ -39,6 +40,7 @@ type AutomationConfig struct {
 	SystemNodePath        string `yaml:"system_node_path,omitempty"`
 	NodeVersion           string `yaml:"node_version,omitempty"`
 	PlaywrightCoreVersion string `yaml:"playwright_core_version,omitempty"`
+	PuppeteerCoreVersion  string `yaml:"puppeteer_core_version,omitempty"`
 }
 
 // Config 应用配置

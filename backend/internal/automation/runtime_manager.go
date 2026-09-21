@@ -64,9 +64,20 @@ func (m *Manager) ensureInstalled(ctx context.Context, flagAlreadySet bool) erro
 	if err := m.installPlaywrightRuntime(ctx, workspace.TempRoot, workspace.StagingDir, auto.PlaywrightCoreVersion); err != nil {
 		return m.installFailed(err)
 	}
+	packageNodePath := nodePlan.SystemNode.Path
+	if nodePlan.UseBundledNode {
+		packageNodePath = m.nodeExecutablePath(workspace.StagingDir)
+	}
+	if err := m.installPuppeteerRuntime(ctx, workspace.StagingDir, packageNodePath, auto.PuppeteerCoreVersion); err != nil {
+		return m.installFailed(err)
+	}
 
 	nodeSource, nodeVersion, nodePath, err := m.resolveInstalledNodeRuntime(ctx, workspace.TempRoot, workspace.StagingDir, auto, nodeMode, nodePlan)
 	if err != nil {
+		return m.installFailed(err)
+	}
+	// Probe bundled and fallback Node too before replacing a working runtime.
+	if _, err := m.verifyNodeWithPlaywright(ctx, nodePath, workspace.StagingDir); err != nil {
 		return m.installFailed(err)
 	}
 

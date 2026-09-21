@@ -1,6 +1,6 @@
 package service
 
-import "zerlinpi/Ant-Browser/fingerprint-engine/model"
+import "ant-chrome/fingerprint-engine/model"
 
 // Generator creates fingerprint templates.
 type Generator struct{}
@@ -11,9 +11,9 @@ func NewGenerator() *Generator {
 
 func (g *Generator) Generate(mode string) model.Template {
 	return model.Template{
-		ID: mode,
-		Mode: mode,
-		Browser: "chromium",
+		ID:       mode,
+		Mode:     mode,
+		Browser:  "chromium",
 		Platform: "windows",
 	}
 }

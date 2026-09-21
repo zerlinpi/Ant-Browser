@@ -3,9 +3,17 @@ package browser
 import (
 	"ant-chrome/backend/internal/apppath"
 	"ant-chrome/backend/internal/config"
+	"net/http"
 	"os/exec"
 	"sync"
 )
+
+// ProxyDownloadHTTPClient builds the HTTP client used by browser-core
+// downloads.  The backend injects this so downloads use the same connector
+// stack as browser instances without coupling this package to proxy managers.
+// A nil callback preserves the legacy system/direct transport behavior for
+// standalone Manager users and older tests.
+type ProxyDownloadHTTPClient func(proxyConfig string) (*http.Client, error)
 
 // Profile 浏览器配置文件
 type Profile struct {
@@ -157,6 +165,10 @@ type Manager struct {
 	BookmarkDAO  BookmarkDAO
 	GroupDAO     GroupDAO
 	ExtensionDAO ExtensionDAO
+
+	// DownloadHTTPClient is optional and is set by the Wails backend after the
+	// Xray/sing-box/Mihomo managers are initialized.
+	DownloadHTTPClient ProxyDownloadHTTPClient
 }
 
 // XrayBridge Xray 桥接进程

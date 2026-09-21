@@ -195,10 +195,16 @@ func (m *Manager) verifyNodeWithPlaywright(ctx context.Context, nodePath, runtim
 const path = require('path');
 const pkg = require(path.join(process.argv[1], 'node_modules', 'playwright-core', 'package.json'));
 const playwright = require(path.join(process.argv[1], 'node_modules', 'playwright-core'));
+const puppeteerPath = path.join(process.argv[1], 'node_modules', 'puppeteer-core');
+const hasPuppeteer = require('fs').existsSync(path.join(puppeteerPath, 'package.json'));
+const puppeteerPkg = hasPuppeteer ? require(path.join(puppeteerPath, 'package.json')) : null;
+const puppeteer = hasPuppeteer ? require(puppeteerPath) : null;
 process.stdout.write(JSON.stringify({
   nodeVersion: process.versions.node,
   playwrightVersion: pkg.version,
-  hasChromium: !!playwright.chromium
+  puppeteerVersion: puppeteerPkg ? puppeteerPkg.version : '',
+  hasChromium: !!playwright.chromium,
+  hasPuppeteerConnect: !hasPuppeteer || typeof puppeteer.connect === 'function'
 }));
 `
 
@@ -215,21 +221,24 @@ process.stdout.write(JSON.stringify({
 	}
 
 	var payload struct {
-		NodeVersion       string `json:"nodeVersion"`
-		PlaywrightVersion string `json:"playwrightVersion"`
-		HasChromium       bool   `json:"hasChromium"`
+		NodeVersion         string `json:"nodeVersion"`
+		PlaywrightVersion   string `json:"playwrightVersion"`
+		PuppeteerVersion    string `json:"puppeteerVersion"`
+		HasChromium         bool   `json:"hasChromium"`
+		HasPuppeteerConnect bool   `json:"hasPuppeteerConnect"`
 	}
 	if err := json.Unmarshal(output, &payload); err != nil {
 		return RuntimeCheckResult{}, fmt.Errorf("parse playwright probe result failed: %w", err)
 	}
 
 	result := RuntimeCheckResult{
-		OK:                strings.TrimSpace(payload.NodeVersion) != "" && strings.TrimSpace(payload.PlaywrightVersion) != "" && payload.HasChromium,
+		OK:                strings.TrimSpace(payload.NodeVersion) != "" && strings.TrimSpace(payload.PlaywrightVersion) != "" && payload.HasChromium && payload.HasPuppeteerConnect,
 		NodeVersion:       strings.TrimSpace(payload.NodeVersion),
 		PlaywrightVersion: strings.TrimSpace(payload.PlaywrightVersion),
+		PuppeteerVersion:  strings.TrimSpace(payload.PuppeteerVersion),
 	}
 	if !result.OK {
-		return RuntimeCheckResult{}, fmt.Errorf("playwright probe returned incomplete result")
+		return RuntimeCheckResult{}, fmt.Errorf("automation runtime probe returned incomplete result")
 	}
 	return result, nil
 }

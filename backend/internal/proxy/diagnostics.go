@@ -13,6 +13,9 @@ type BuildDiagnosticOptions struct {
 	XrayMgr    *XrayManager
 	SingBoxMgr *SingBoxManager
 	ClashMgr   *ClashManager
+	// ConnectorType selects the active browser connector stack. Empty keeps
+	// the historical xray-combination default for package-level callers.
+	ConnectorType string
 }
 
 // ProxyBuildDiagnostic 是不启动桥接进程的代理构建诊断结果。
@@ -84,7 +87,7 @@ func BuildProxyDiagnostic(proxyConfig string, proxies []config.BrowserProxy, pro
 
 	src = normalizeNodeScheme(src)
 	result.RawConfigMasked = maskProxyConfig(src)
-	resolution, err := ResolveProxyKernel(src, proxies, proxyId, "")
+	resolution, err := ResolveProxyKernelForConnector(src, proxies, proxyId, options.ConnectorType)
 	if err != nil {
 		result.Errors = append(result.Errors, err.Error())
 		return result
