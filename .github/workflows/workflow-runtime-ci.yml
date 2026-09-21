@@ -1,11 +1,12 @@
 name: Workflow runtime
 on:
+  workflow_dispatch:
   pull_request:
     paths:
       - 'backend/internal/automation/**'
       - '.github/workflows/workflow-runtime-ci.yml'
   push:
-    branches: [main]
+    branches: [master]
     paths:
       - 'backend/internal/automation/**'
       - '.github/workflows/workflow-runtime-ci.yml'

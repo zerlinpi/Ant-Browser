@@ -1,6 +1,7 @@
 name: Cloud control plane CI
 
 on:
+  workflow_dispatch:
   pull_request:
     paths:
       - "server/**"
@@ -11,7 +12,7 @@ on:
       - "frontend/**"
       - ".github/workflows/cloud-control-plane-ci.yml"
   push:
-    branches: [main]
+    branches: [master]
     paths:
       - "server/**"
       - "database/**"
