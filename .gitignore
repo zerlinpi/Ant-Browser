@@ -93,6 +93,9 @@ __pycache__/
 .tmp/runtime-cache/
 .codex-tmp/
 
+# Local assistant state (memory notes / scratch), never shared
+.workbuddy-ai/
+
 # Test outputs / coverage
 coverage/
 *.out
