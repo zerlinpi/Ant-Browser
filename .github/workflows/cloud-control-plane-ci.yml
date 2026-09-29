@@ -10,6 +10,12 @@ on:
       - "backend/**"
       - "desktop/**"
       - "frontend/**"
+      - "tools/**"
+      - "go.mod"
+      - "go.sum"
+      - "*.go"
+      - "wails.json"
+      - ".dockerignore"
       - ".github/workflows/cloud-control-plane-ci.yml"
   push:
     branches: [master]
@@ -20,6 +26,12 @@ on:
       - "backend/**"
       - "desktop/**"
       - "frontend/**"
+      - "tools/**"
+      - "go.mod"
+      - "go.sum"
+      - "*.go"
+      - "wails.json"
+      - ".dockerignore"
       - ".github/workflows/cloud-control-plane-ci.yml"
 
 permissions:
@@ -61,6 +73,62 @@ jobs:
       - run: go build -trimpath -o ../.ci-bin/control-plane ./cmd/control-plane
       - run: go build -trimpath -o ../.ci-bin/worker ./cmd/worker
       - run: go build -trimpath -o ../.ci-bin/migrate ./cmd/migrate
+      - run: go build -trimpath -o ../.ci-bin/healthcheck ./cmd/healthcheck
+      # Formatting gates run on Linux (LF checkouts) and even when an earlier
+      # step failed, so test and format results are both reported.
+      - name: gofmt (server module)
+        if: ${{ !cancelled() }}
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "$unformatted"
+            echo "::error title=gofmt::Run gofmt -w on the server files listed above."
+            exit 1
+          fi
+      - name: gofmt (root module)
+        if: ${{ !cancelled() }}
+        working-directory: .
+        # The root module is every Go file outside the nested server module.
+        # .codex-tmp holds local Go SDK and module caches when present.
+        run: |
+          unformatted="$(find . -type f -name '*.go' \
+            -not -path './.git/*' -not -path './.codex-tmp/*' \
+            -not -path './server/*' -not -path '*/node_modules/*' \
+            -print0 | xargs -0 -r gofmt -l)"
+          if [ -n "$unformatted" ]; then
+            echo "$unformatted"
+            echo "::error title=gofmt::Run gofmt -w on the root-module files listed above."
+            exit 1
+          fi
+
+  containers:
+    # Validates the Compose/Nginx/Docker setup exactly as deployed, without
+    # pushing anything: every image is built from the repository-root context
+    # so .dockerignore regressions surface here.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose configuration
+        run: |
+          docker compose version
+          docker compose -f deploy/compose/docker-compose.yml --env-file deploy/.env.example config -q
+          docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/proxy-health.yml --env-file deploy/.env.example config -q
+      - name: Validate edge Nginx configuration
+        run: |
+          docker run --rm \
+            --add-host control-plane:127.0.0.1 \
+            --add-host frontend:127.0.0.1 \
+            -v "$PWD/deploy/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro" \
+            nginx:1.27-alpine nginx -t
+      - name: Build control-plane image
+        run: docker build --target runtime -f deploy/docker/control-plane/Dockerfile -t ant-browser-control-plane:ci .
+      - name: Build worker image
+        run: docker build --target runtime -f deploy/docker/worker/Dockerfile -t ant-browser-worker:ci .
+      - name: Build frontend image
+        run: docker build --target runtime -f deploy/docker/frontend/Dockerfile -t ant-browser-frontend:ci .
+      - name: Validate frontend image Nginx configuration
+        run: docker run --rm ant-browser-frontend:ci nginx -t
 
   desktop-and-ui:
     runs-on: ubuntu-latest
@@ -91,3 +159,32 @@ jobs:
       - run: npm run build
         working-directory: desktop/vue3-ui
       - run: go test ./...
+
+  windows-desktop:
+    # The desktop client ships on Windows; build it there so Windows-only
+    # files (*_windows.go) and the embedded frontends compile together.
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            desktop/vue3-ui/package-lock.json
+      # Same embed requirement as desktop-and-ui: build both dist trees first.
+      - run: npm ci
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend
+      - run: npm ci
+        working-directory: desktop/vue3-ui
+      - run: npm run build
+        working-directory: desktop/vue3-ui
+      - run: go build ./...
