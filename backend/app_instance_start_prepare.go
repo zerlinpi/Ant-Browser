@@ -1,13 +1,15 @@
 package backend
 
 import (
-	"ant-chrome/backend/internal/browser"
-	"ant-chrome/backend/internal/logger"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"ant-chrome/backend/internal/browser"
+	"ant-chrome/backend/internal/cloudagent"
+	"ant-chrome/backend/internal/logger"
 )
 
 type browserStartInput struct {
@@ -19,6 +21,11 @@ type browserStartInput struct {
 	ForceDirectProxy     bool
 	TemporaryProxyID     string
 	TemporaryProxyConfig string
+	CloudRuntimeConfig   *cloudagent.InstanceRuntimeConfig
+	// CloudInstanceID is the cloud browser instance the runtime config was
+	// resolved for. It is bound locally to ProfileID, which is an arbitrary
+	// local profile identifier and need not equal the cloud UUID.
+	CloudInstanceID string
 }
 
 type browserStartPlan struct {
@@ -93,6 +100,15 @@ func (a *App) resolveBrowserStartProfile(input browserStartInput) (*BrowserProfi
 		a.markProfileStoppedLocked(input.ProfileID, profile)
 		return profile, false, nil
 	}
+	if err := a.validateRunningCloudRuntime(input, profile); err != nil {
+		startErr := fmt.Errorf("refusing to reuse browser with mismatched cloud runtime: %w", err)
+		profile.LastError = startErr.Error()
+		log.Error("cloud runtime reuse validation failed",
+			logger.F("profile_id", input.ProfileID),
+			logger.F("error", err.Error()),
+		)
+		return profile, true, startErr
+	}
 
 	if len(normalizeNonEmptyStrings(input.StartURLs)) == 0 && len(normalizeNonEmptyStrings(input.ExtraLaunchArgs)) == 0 {
 		if a.launchServer != nil && profile.DebugReady {
@@ -129,6 +145,11 @@ func (a *App) prepareBrowserStartPlan(input browserStartInput, profile *BrowserP
 	if err != nil {
 		return nil, err
 	}
+	runtimeExtensionDir, err := a.prepareCloudFingerprintRuntimeExtension(input)
+	if err != nil {
+		profile.LastError = err.Error()
+		return nil, err
+	}
 
 	effectiveProxy, acquiredProxyBridge, releaseProxyBridge, err := a.resolveBrowserStartProxy(input, profile)
 	if err != nil {
@@ -140,6 +161,9 @@ func (a *App) prepareBrowserStartPlan(input browserStartInput, profile *BrowserP
 	totalReadyTimeout := time.Duration(maxStartAttempts) * startReadyTimeout
 	restoreLastSession := profileRestoreLastSession(profile, a.config)
 	extensionDirs := a.browserMgr.EnabledExtensionDirsForProfile(input.ProfileID)
+	if runtimeExtensionDir != "" {
+		extensionDirs = appendUniqueExtensionDir(extensionDirs, runtimeExtensionDir)
+	}
 	fingerprintExpectedArgs := combineFingerprintExpectedArgs(fingerprintLaunchArgs, sanitizedProfileLaunchArgs, sanitizedExtraLaunchArgs)
 	defaultStartURLs := a.resolveFingerprintCheckStartURLsForExpectedArgsAndProfile(profile.ProfileId, fingerprintExpectedArgs, profile, mergeStartURLs(browserDefaultStartURLs(a.config), bookmarkStartURLs(bookmarks)))
 	startURLs := a.resolveFingerprintCheckStartURLsForExpectedArgsAndProfile(profile.ProfileId, fingerprintExpectedArgs, profile, input.StartURLs)
@@ -193,6 +217,15 @@ func (a *App) prepareBrowserLaunchContext(input browserStartInput, profile *Brow
 	sanitizedExtraLaunchArgs, managedExtraArgs := sanitizeManagedLaunchArgs(input.ExtraLaunchArgs)
 	logManagedLaunchArgOverrides(log, input.ProfileID, "profile.launchArgs", managedProfileArgs)
 	logManagedLaunchArgOverrides(log, input.ProfileID, "start.extraLaunchArgs", managedExtraArgs)
+	fingerprintSourceArgs := profile.FingerprintArgs
+	if input.CloudRuntimeConfig != nil && input.CloudRuntimeConfig.Fingerprint != nil {
+		var profileOverrides, extraOverrides []string
+		sanitizedProfileLaunchArgs, profileOverrides = removeCloudFingerprintLaunchOverrides(sanitizedProfileLaunchArgs)
+		sanitizedExtraLaunchArgs, extraOverrides = removeCloudFingerprintLaunchOverrides(sanitizedExtraLaunchArgs)
+		logCloudFingerprintLaunchOverrides(log, input.ProfileID, "profile.launchArgs", profileOverrides)
+		logCloudFingerprintLaunchOverrides(log, input.ProfileID, "start.extraLaunchArgs", extraOverrides)
+		fingerprintSourceArgs = input.CloudRuntimeConfig.Fingerprint.RuntimeArgs
+	}
 
 	proxyChanged := a.browserMgr.ApplyDefaults(profile)
 	if proxyChanged {
@@ -224,7 +257,13 @@ func (a *App) prepareBrowserLaunchContext(input browserStartInput, profile *Brow
 		return nil, nil, nil, "", "", startErr
 	}
 
-	fingerprintLaunchArgs := a.buildBrowserFingerprintCapabilityReport(input.ProfileID, profile.CoreId, profile.FingerprintArgs).LaunchArgs
+	fingerprintReport := a.buildBrowserFingerprintCapabilityReport(input.ProfileID, profile.CoreId, fingerprintSourceArgs)
+	if err := validateCloudFingerprintRuntimeCompatibility(input.CloudRuntimeConfig, fingerprintReport.ChromeMajor); err != nil {
+		startErr := fmt.Errorf("cloud fingerprint runtime is incompatible with this browser: %w", err)
+		profile.LastError = startErr.Error()
+		return nil, nil, nil, "", "", startErr
+	}
+	fingerprintLaunchArgs := fingerprintReport.LaunchArgs
 	fingerprintExpectedArgs := combineFingerprintExpectedArgs(fingerprintLaunchArgs, sanitizedProfileLaunchArgs, sanitizedExtraLaunchArgs)
 	runtimeBookmarks, fingerprintBookmarkURL, bookmarkErr := a.runtimeBookmarksForProfileExpectedArgsAndProfile(profile.ProfileId, fingerprintExpectedArgs, profile, bookmarks)
 	if bookmarkErr != nil {
@@ -244,7 +283,14 @@ func (a *App) prepareBrowserLaunchContext(input browserStartInput, profile *Brow
 	}
 
 	if detection, ok := detectBrowserRuntimeByActivePort(userDataDir); ok && detection.DebugReady {
-		a.markProfileLastLaunchArgsLocked(profile, nil)
+		if err := a.validateRunningCloudRuntime(input, profile); err != nil {
+			startErr := fmt.Errorf("refusing to adopt browser with unverified cloud runtime: %w", err)
+			profile.LastError = startErr.Error()
+			return nil, nil, nil, "", "", startErr
+		}
+		if input.CloudRuntimeConfig == nil {
+			a.markProfileLastLaunchArgsLocked(profile, nil)
+		}
 		a.markProfileRunningLocked(input.ProfileID, profile, nil, detection.PID, detection.DebugPort, true, "")
 		log.Warn("检测到同一用户数据目录已有浏览器运行，已接管为当前实例状态",
 			logger.F("profile_id", input.ProfileID),

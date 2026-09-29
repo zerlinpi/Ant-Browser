@@ -52,6 +52,23 @@ func isUniqueViolation(err error) bool {
 	return errors.As(err, &pgError) && pgError.Code == "23505"
 }
 
+// Live-row name indexes from migration 027. A violation of one of them is a
+// user-facing name conflict; any other unique violation is not.
+const (
+	instanceNameIndex      = "browser_instances_live_name_uq"
+	proxyNameIndex         = "proxies_live_name_uq"
+	accountIdentifierIndex = "accounts_live_identifier_uq"
+	profileNameIndex       = "browser_profiles_live_name_uq"
+	workflowNameConstraint = "workflows_workspace_id_name_key"
+)
+
+// isUniqueViolationOn reports a unique violation of the named constraint or
+// unique index (PostgreSQL reports the index name for index violations).
+func isUniqueViolationOn(err error, name string) bool {
+	var pgError *pgconn.PgError
+	return errors.As(err, &pgError) && pgError.Code == "23505" && pgError.ConstraintName == name
+}
+
 func isForeignKeyViolation(err error) bool {
 	var pgError *pgconn.PgError
 	return errors.As(err, &pgError) && pgError.Code == "23503"

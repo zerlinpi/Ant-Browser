@@ -121,6 +121,47 @@ func (s *Store) RevokeDevice(ctx context.Context, userID, deviceID string, now t
 	return tx.Commit(ctx)
 }
 
+// RotateDeviceCredential locks the user's device row, revokes every active
+// credential of the device, and inserts the replacement in one transaction.
+// The row lock serializes rotation with revocation: a concurrent RevokeDevice
+// either waits and then revokes the new credential too, or commits first and
+// makes this rotation fail with ErrRevoked.
+func (s *Store) RotateDeviceCredential(ctx context.Context, userID, deviceID string, credential deviceservice.Credential, now time.Time) (deviceservice.Device, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return deviceservice.Device{}, err
+	}
+	defer rollback(ctx, tx)
+	device, err := scanDevice(tx.QueryRow(ctx, `
+		SELECT `+deviceColumns+` FROM devices d
+		WHERE d.id = $1::uuid AND d.user_id = $2::uuid
+		FOR UPDATE OF d
+	`, deviceID, userID))
+	if err != nil {
+		return deviceservice.Device{}, err
+	}
+	if device.RevokedAt != nil {
+		return deviceservice.Device{}, deviceservice.ErrRevoked
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE device_credentials SET revoked_at = $2
+		WHERE device_id = $1::uuid AND revoked_at IS NULL
+	`, deviceID, now); err != nil {
+		return deviceservice.Device{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO device_credentials (
+			id, device_id, credential_hash, key_version, created_at, expires_at, revoked_at
+		) VALUES ($1::uuid, $2::uuid, decode($3, 'hex'), 'v1', $4, $5, NULL)
+	`, credential.ID, deviceID, credential.SecretHash, credential.CreatedAt, credential.ExpiresAt); err != nil {
+		return deviceservice.Device{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return deviceservice.Device{}, err
+	}
+	return device, nil
+}
+
 func (s *Store) AuthenticateDevice(ctx context.Context, deviceID, credentialHash string) (deviceservice.Device, error) {
 	return scanDevice(s.pool.QueryRow(ctx, `
 		SELECT `+deviceColumns+`

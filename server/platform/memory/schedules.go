@@ -84,7 +84,7 @@ func (s *Store) DeleteSchedule(_ context.Context, workspace, id string) error {
 	delete(st.items, id)
 	return nil
 }
-func (s *Store) SetScheduleEnabled(_ context.Context, workspace, id string, enabled bool, now time.Time) (scheduleservice.Schedule, error) {
+func (s *Store) SetScheduleEnabled(_ context.Context, workspace, id string, enabled bool, nextRunAt *time.Time, expectedVersion int64, now time.Time) (scheduleservice.Schedule, error) {
 	st := s.schedule()
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -92,11 +92,19 @@ func (s *Store) SetScheduleEnabled(_ context.Context, workspace, id string, enab
 	if !ok || item.WorkspaceID != workspace {
 		return scheduleservice.Schedule{}, scheduleservice.ErrNotFound
 	}
+	if expectedVersion < 1 || item.Version != expectedVersion {
+		return scheduleservice.Schedule{}, scheduleservice.ErrVersionConflict
+	}
 	item.Enabled = enabled
 	if enabled {
 		item.Status = "active"
 	} else {
 		item.Status = "paused"
+	}
+	item.NextRunAt = nil
+	if nextRunAt != nil {
+		next := nextRunAt.UTC()
+		item.NextRunAt = &next
 	}
 	item.Version++
 	item.UpdatedAt = now

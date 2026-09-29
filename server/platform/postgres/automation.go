@@ -39,8 +39,8 @@ func (s *Store) CreateWorkflow(ctx context.Context, workflow automationservice.W
 		workflow.LatestVersion, workflow.PublishedVersionID, workflow.Version,
 		workflow.CreatedBy, workflow.CreatedAt, workflow.UpdatedAt, workflow.ArchivedAt)
 	if err != nil {
-		if isUniqueViolation(err) {
-			return errors.New("workflow name already exists")
+		if isUniqueViolationOn(err, workflowNameConstraint) {
+			return automationservice.ErrNameConflict
 		}
 		if isForeignKeyViolation(err) {
 			return automationservice.ErrNotFound

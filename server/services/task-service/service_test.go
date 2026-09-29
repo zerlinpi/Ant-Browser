@@ -81,10 +81,10 @@ func TestIdempotencyRejectsDifferentTaskRequests(t *testing.T) {
 		Payload:        map[string]interface{}{"scope": "one"},
 	}
 	for name, different := range map[string]taskservice.Task{
-		"task type":    {TaskType: "proxy.health_check", IdempotencyKey: base.IdempotencyKey, Priority: base.Priority, RetryLimit: base.RetryLimit, Payload: base.Payload},
-		"payload":      {TaskType: base.TaskType, IdempotencyKey: base.IdempotencyKey, Priority: base.Priority, RetryLimit: base.RetryLimit, Payload: map[string]interface{}{"scope": "two"}},
-		"priority":     {TaskType: base.TaskType, IdempotencyKey: base.IdempotencyKey, Priority: 2, RetryLimit: base.RetryLimit, Payload: base.Payload},
-		"retry limit":  {TaskType: base.TaskType, IdempotencyKey: base.IdempotencyKey, Priority: base.Priority, RetryLimit: 2, Payload: base.Payload},
+		"task type":     {TaskType: "proxy.health_check", IdempotencyKey: base.IdempotencyKey, Priority: base.Priority, RetryLimit: base.RetryLimit, Payload: base.Payload},
+		"payload":       {TaskType: base.TaskType, IdempotencyKey: base.IdempotencyKey, Priority: base.Priority, RetryLimit: base.RetryLimit, Payload: map[string]interface{}{"scope": "two"}},
+		"priority":      {TaskType: base.TaskType, IdempotencyKey: base.IdempotencyKey, Priority: 2, RetryLimit: base.RetryLimit, Payload: base.Payload},
+		"retry limit":   {TaskType: base.TaskType, IdempotencyKey: base.IdempotencyKey, Priority: base.Priority, RetryLimit: 2, Payload: base.Payload},
 		"workflow type": {TaskType: "workflow.execute", WorkflowID: "flow", WorkflowVersionID: "version", IdempotencyKey: base.IdempotencyKey, Payload: map[string]interface{}{"instanceId": "instance"}},
 	} {
 		t.Run(name, func(t *testing.T) {

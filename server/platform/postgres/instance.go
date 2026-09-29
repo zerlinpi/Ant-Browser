@@ -6,6 +6,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	billingservice "github.com/zerlinpi/Ant-Browser/server/services/billing-service"
 	browserinstanceservice "github.com/zerlinpi/Ant-Browser/server/services/browser-instance-service"
@@ -51,8 +52,8 @@ func (s *Store) CreateInstance(ctx context.Context, instance browserinstanceserv
 	if isForeignKeyViolation(err) {
 		return workspaceservice.ErrNotFound
 	}
-	if isUniqueViolation(err) {
-		return errors.New("browser instance name already exists")
+	if isUniqueViolationOn(err, instanceNameIndex) {
+		return browserinstanceservice.ErrNameConflict
 	}
 	if isBillingQuotaViolation(err) {
 		return billingservice.ErrQuotaExceeded
@@ -140,6 +141,9 @@ func (s *Store) UpdateInstance(ctx context.Context, instance browserinstanceserv
 		instance.CurrentRevision, tags, instance.LastSeenAt, instance.UpdatedAt))
 	if isForeignKeyViolation(err) {
 		return browserinstanceservice.BrowserInstance{}, browserinstanceservice.ErrInvalidInput
+	}
+	if isUniqueViolationOn(err, instanceNameIndex) {
+		return browserinstanceservice.BrowserInstance{}, browserinstanceservice.ErrNameConflict
 	}
 	if errors.Is(err, browserinstanceservice.ErrNotFound) {
 		if _, findErr := s.FindInstance(ctx, instance.WorkspaceID, instance.ID); findErr == nil {
@@ -360,6 +364,33 @@ func (s *Store) TransitionCommand(
 			return browserinstanceservice.Command{}, err
 		}
 		if tag.RowsAffected() != 1 {
+			return browserinstanceservice.Command{}, browserinstanceservice.ErrStateConflict
+		}
+		targetDeviceID, ok := updated.Payload["targetDeviceId"].(string)
+		if !ok {
+			return browserinstanceservice.Command{}, browserinstanceservice.ErrStateConflict
+		}
+		followUpTag, err := tx.Exec(ctx, `
+			INSERT INTO instance_commands (
+				id, command_id, workspace_id, instance_id, device_id, action,
+				idempotency_key, expected_version, status, payload, deadline,
+				created_by, created_at, acknowledged_at, completed_at,
+				error_code, failure_message
+			)
+			SELECT
+				$3::uuid, $3::uuid, b.workspace_id, b.id, b.assigned_device_id, 'instance.start',
+				$4, b.version, 'pending', '{}'::jsonb, $2 + interval '2 minutes',
+				NULLIF($5, '')::uuid, $2, NULL, NULL, '', ''
+			FROM browser_instances AS b
+			WHERE b.workspace_id = $1::uuid AND b.id = $6::uuid
+			  AND b.assigned_device_id = $7::uuid
+			  AND b.deleted_at IS NULL
+		`, workspaceID, now, uuid.NewString(),
+			browserinstanceservice.MigrationStartIdempotencyKey(updated.ID), updated.CreatedBy, updated.InstanceID, targetDeviceID)
+		if err != nil {
+			return browserinstanceservice.Command{}, err
+		}
+		if followUpTag.RowsAffected() != 1 {
 			return browserinstanceservice.Command{}, browserinstanceservice.ErrStateConflict
 		}
 	}

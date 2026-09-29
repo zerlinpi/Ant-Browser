@@ -35,7 +35,7 @@ func (s *Store) CreateWorkflow(_ context.Context, workflow automationservice.Wor
 	defer state.mu.Unlock()
 	for _, current := range state.workflows {
 		if current.WorkspaceID == workflow.WorkspaceID && current.Name == workflow.Name {
-			return automationservice.ErrVersionConflict
+			return automationservice.ErrNameConflict
 		}
 	}
 	state.workflows[workflow.ID] = workflow

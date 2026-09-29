@@ -8,6 +8,11 @@ import (
 	"time"
 )
 
+// ErrInvalidCron classifies every rejected cron expression: a malformed one
+// and one that never fires (such as 30 February). Callers match it with
+// errors.Is; the wrapped message names the problem.
+var ErrInvalidCron = errors.New("invalid cron expression")
+
 // Cron is the intentionally small, standard five-field cron dialect used by
 // schedules. Fields are minute, hour, day-of-month, month, day-of-week.
 type Cron struct{ fields [5]field }
@@ -20,14 +25,14 @@ type field struct {
 func ParseCron(expression string) (Cron, error) {
 	parts := strings.Fields(strings.TrimSpace(expression))
 	if len(parts) != 5 {
-		return Cron{}, errors.New("cron expression must contain five fields")
+		return Cron{}, fmt.Errorf("%w: cron expression must contain five fields", ErrInvalidCron)
 	}
 	ranges := [5][2]int{{0, 59}, {0, 23}, {1, 31}, {1, 12}, {0, 6}}
 	var result Cron
 	for i, part := range parts {
 		f, err := parseField(part, ranges[i][0], ranges[i][1])
 		if err != nil {
-			return Cron{}, fmt.Errorf("cron field %d: %w", i+1, err)
+			return Cron{}, fmt.Errorf("%w: cron field %d: %v", ErrInvalidCron, i+1, err)
 		}
 		result.fields[i] = f
 	}
@@ -121,7 +126,7 @@ func (c Cron) Next(after time.Time, location *time.Location) (time.Time, error) 
 		}
 		cursor = cursor.Add(time.Minute)
 	}
-	return time.Time{}, errors.New("cron expression has no occurrence in search window")
+	return time.Time{}, fmt.Errorf("%w: cron expression has no occurrence in search window", ErrInvalidCron)
 }
 
 // During a fall-back transition one wall-clock minute can map to two UTC

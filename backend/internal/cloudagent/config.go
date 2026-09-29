@@ -12,10 +12,11 @@ import (
 )
 
 type Config struct {
-	BaseURL     string            `json:"baseUrl"`
-	DeviceID    string            `json:"deviceId"`
-	WorkspaceID string            `json:"workspaceId"`
-	Bindings    map[string]string `json:"bindings"`
+	BaseURL       string            `json:"baseUrl"`
+	DeviceID      string            `json:"deviceId"`
+	WorkspaceID   string            `json:"workspaceId"`
+	Bindings      map[string]string `json:"bindings"`
+	CloudProfiles map[string]string `json:"cloudProfiles,omitempty"`
 }
 
 // Credentials intentionally cannot be stored in this configuration file.
@@ -74,5 +75,28 @@ func LoadConfig(path string) (Config, error) {
 		bindings[canonicalCloudID] = profileID
 	}
 	config.Bindings = bindings
+	cloudProfiles := make(map[string]string, len(config.CloudProfiles))
+	seenCloudProfiles := make(map[string]bool, len(config.CloudProfiles))
+	for cloudInstanceID, cloudProfileID := range config.CloudProfiles {
+		parsedInstanceID, err := uuid.Parse(strings.TrimSpace(cloudInstanceID))
+		if err != nil {
+			return Config{}, errors.New("cloud profile binding instance IDs must be UUIDs")
+		}
+		canonicalInstanceID := parsedInstanceID.String()
+		if _, bound := bindings[canonicalInstanceID]; !bound {
+			return Config{}, errors.New("cloud profile bindings require a local instance binding")
+		}
+		parsedProfileID, err := uuid.Parse(strings.TrimSpace(cloudProfileID))
+		if err != nil {
+			return Config{}, errors.New("cloud profile IDs must be UUIDs")
+		}
+		canonicalProfileID := parsedProfileID.String()
+		if seenCloudProfiles[canonicalProfileID] {
+			return Config{}, errors.New("cloud profile bindings must be distinct")
+		}
+		seenCloudProfiles[canonicalProfileID] = true
+		cloudProfiles[canonicalInstanceID] = canonicalProfileID
+	}
+	config.CloudProfiles = cloudProfiles
 	return config, nil
 }

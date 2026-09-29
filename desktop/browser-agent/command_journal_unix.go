@@ -5,6 +5,7 @@ package browseragent
 import (
 	"errors"
 	"os"
+	"syscall"
 )
 
 func secureJournalRoot(path string) error {
@@ -25,4 +26,12 @@ func syncJournalDirectory(path string) error {
 	}
 	defer directory.Close()
 	return directory.Sync()
+}
+
+func lockJournalFile(file *os.File) error {
+	return syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+}
+
+func unlockJournalFile(file *os.File) error {
+	return syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
 }

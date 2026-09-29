@@ -229,8 +229,8 @@ func (g *Gateway) recordAccountRiskEvent(w http.ResponseWriter, r *http.Request)
 		if _, notifyErr := g.notifications.Publish(r.Context(), notificationservice.CreateInput{
 			WorkspaceID: item.WorkspaceID, RecipientUserID: mustPrincipal(r.Context()).UserID,
 			EventType: "account.risk_event", Title: "Account risk event",
-			Body: input.Code + ": " + input.Description,
-			Payload: map[string]interface{}{"accountId": item.AccountID, "level": item.Level, "code": item.Code},
+			Body:           input.Code + ": " + input.Description,
+			Payload:        map[string]interface{}{"accountId": item.AccountID, "level": item.Level, "code": item.Code},
 			IdempotencyKey: "risk-event:" + item.ID,
 		}); notifyErr != nil {
 			g.logger.WarnContext(r.Context(), "risk_notification_publish_failed", "risk_event_id", item.ID, "error", notifyErr)

@@ -165,7 +165,7 @@ func (g *Gateway) agentSocket(w http.ResponseWriter, r *http.Request) {
 		ReadBufferSize:   4096,
 		WriteBufferSize:  4096,
 		Subprotocols:     []string{agentSubprotocol},
-		CheckOrigin:      agentOriginAllowed,
+		CheckOrigin:      g.originAllowed,
 	}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -238,6 +238,11 @@ func (g *Gateway) subscribeCommands(ctx context.Context) {
 }
 
 func (g *Gateway) authenticateAgent(r *http.Request) (deviceservice.Device, error) {
+	// Agent routes authenticate once in withAgentAuthentication (devices.go),
+	// which answers infrastructure failures with 503; reuse its result.
+	if cached, ok := cachedAgentAuthentication(r); ok {
+		return cached.device, cached.err
+	}
 	deviceID := strings.TrimSpace(r.Header.Get("X-Device-ID"))
 	header := strings.TrimSpace(r.Header.Get("Authorization"))
 	parts := strings.SplitN(header, " ", 2)
@@ -305,13 +310,27 @@ func (c *agentClient) handleMessage(g *Gateway, message agentInbound) error {
 		if err := json.Unmarshal(message.Payload, &payload); err != nil || strings.TrimSpace(payload.CommandID) == "" {
 			return agentProtocolProblem{message: "command event payload is invalid"}
 		}
-		_, err := g.instances.ApplyAgentCommandEvent(
+		updated, err := g.instances.ApplyAgentCommandEvent(
 			c.connContext(), c.workspaceID, c.deviceID, payload.CommandID,
 			browserinstanceservice.AgentCommandEventInput{
 				Status:      strings.TrimPrefix(message.Type, "command."),
 				FailureCode: payload.FailureCode, FailureMessage: payload.FailureMessage,
 			},
 		)
+		if err == nil && updated.Action == "instance.migrate" && updated.Status == "completed" {
+			targetDeviceID, _ := updated.Payload["targetDeviceId"].(string)
+			commands, pendingErr := g.instances.PendingCommands(c.connContext(), c.workspaceID, targetDeviceID)
+			if pendingErr != nil {
+				return pendingErr
+			}
+			followUpKey := browserinstanceservice.MigrationStartIdempotencyKey(updated.ID)
+			for _, command := range commands {
+				if command.IdempotencyKey == followUpKey {
+					g.dispatchInstanceCommand(c.connContext(), command)
+					break
+				}
+			}
+		}
 		return err
 	case "instance.observed":
 		var payload agentObservedStatePayload
@@ -423,11 +442,19 @@ func supportsAgentSubprotocol(r *http.Request) bool {
 	return false
 }
 
-func agentOriginAllowed(r *http.Request) bool {
+func (g *Gateway) originAllowed(r *http.Request) bool {
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
 	if origin == "" {
 		return true
 	}
 	parsed, err := url.Parse(origin)
-	return err == nil && strings.EqualFold(parsed.Host, r.Host)
+	if err == nil && strings.EqualFold(parsed.Host, r.Host) {
+		return true
+	}
+	for _, allowed := range g.allowedOrigins {
+		if strings.EqualFold(strings.TrimSpace(allowed), origin) {
+			return true
+		}
+	}
+	return false
 }

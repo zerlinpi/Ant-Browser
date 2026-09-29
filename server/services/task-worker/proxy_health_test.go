@@ -16,6 +16,7 @@ type healthFixture struct {
 	probes      int
 	failure     error
 	lookupError error
+	result      proxyservice.HealthResult
 }
 
 func (f *healthFixture) FindProxy(context.Context, string, string) (proxyservice.Proxy, error) {
@@ -59,6 +60,9 @@ func TestProxyHealthEndsInvalidatedChecks(t *testing.T) {
 }
 func (f *healthFixture) Probe(context.Context, proxyservice.Proxy) (proxyservice.HealthResult, error) {
 	f.probes++
+	if f.result.Status != "" {
+		return f.result, f.failure
+	}
 	return proxyservice.HealthResult{Status: "succeeded", IP: "203.0.113.10", LatencyMS: 20}, f.failure
 }
 func healthTask() (*healthFixture, taskservice.Task) {
@@ -112,5 +116,38 @@ func TestProxyHealthDoesNotLeakProbeError(t *testing.T) {
 	}
 	if f.check.CompletedAt != nil {
 		t.Fatal("infrastructure failure completed check")
+	}
+}
+
+func TestProxyHealthPublishesStableFailureNotification(t *testing.T) {
+	f, task := healthTask()
+	f.check.CreatedBy = "user"
+	f.result = proxyservice.HealthResult{Status: "failed"}
+	publisher := &fakeNotificationPublisher{}
+	handler, err := NewProxyHealthHandler(f, f, publisher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := handler(context.Background(), task)
+	if err != nil || result["status"] != "failed" {
+		t.Fatalf("result=%v err=%v", result, err)
+	}
+	inputs := publisher.snapshot()
+	if len(inputs) != 1 {
+		t.Fatalf("notifications=%d want=1", len(inputs))
+	}
+	input := inputs[0]
+	if input.EventType != "proxy.health_failed" || input.RecipientUserID != "user" || input.IdempotencyKey != "proxy-health-failure:check" {
+		t.Fatalf("unexpected notification: %+v", input)
+	}
+	if input.Payload["errorCode"] != "proxy_unreachable" || input.Payload["kernel"] != proxyservice.KernelSingBox {
+		t.Fatalf("unexpected payload: %+v", input.Payload)
+	}
+	// A replay reuses the same idempotency key and does not probe again.
+	if _, err := handler(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	if f.probes != 1 || len(publisher.snapshot()) != 2 {
+		t.Fatalf("probe=%d publish attempts=%d", f.probes, len(publisher.snapshot()))
 	}
 }

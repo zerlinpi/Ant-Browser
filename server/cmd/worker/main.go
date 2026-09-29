@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/zerlinpi/Ant-Browser/server/platform/config"
@@ -71,10 +73,18 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	tasks := taskservice.New(store, nil)
+	notifications := notificationservice.New(store, nil)
 	handlers := map[string]taskworker.Handler{"system.healthcheck": taskworker.SystemHealthcheckHandler}
 	supported := []string{"system.healthcheck"}
 	if executable := os.Getenv("ANT_PROXY_PROBE_EXECUTABLE"); executable != "" {
-		crypto, err := secureenvelope.New(os.Getenv("ANT_SECRET_MASTER_KEY"), os.Getenv("ANT_ENCRYPTION_KEY_REF"), os.Getenv("ANT_SECRET_KEY_VERSION"))
+		// Enforce the control plane's master-key policy (config.Validate) so a
+		// production worker refuses the published development key and
+		// malformed key material instead of decrypting proxy secrets with it.
+		masterKey := strings.TrimSpace(os.Getenv("ANT_SECRET_MASTER_KEY"))
+		if err := config.ValidateSecretMasterKey(cfg.Environment, masterKey); err != nil {
+			return fmt.Errorf("proxy health probe: %w", err)
+		}
+		crypto, err := secureenvelope.New(masterKey, os.Getenv("ANT_ENCRYPTION_KEY_REF"), os.Getenv("ANT_SECRET_KEY_VERSION"))
 		if err != nil {
 			return err
 		}
@@ -86,7 +96,7 @@ func run(logger *slog.Logger) error {
 		if err != nil {
 			return err
 		}
-		handler, err := taskworker.NewProxyHealthHandler(store, probe)
+		handler, err := taskworker.NewProxyHealthHandler(store, probe, notifications)
 		if err != nil {
 			return err
 		}
@@ -96,7 +106,7 @@ func run(logger *slog.Logger) error {
 	worker, err := taskworker.New(
 		tasks, cfg.WorkerID,
 		handlers,
-		cfg.LeaseTTL, cfg.PollInterval, cfg.Parallelism, logger,
+		cfg.LeaseTTL, cfg.PollInterval, cfg.Parallelism, logger, notifications,
 	)
 	if err != nil {
 		return err

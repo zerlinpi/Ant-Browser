@@ -97,6 +97,66 @@ func SecurityHeaders(next http.Handler) http.Handler {
 	})
 }
 
+// CORS permits authenticated browser clients only from an explicit set of
+// origins. Wildcards are intentionally unsupported because desktop and web
+// clients send bearer credentials and idempotency keys.
+func CORS(allowedOrigins []string, next http.Handler) http.Handler {
+	allowed := make(map[string]struct{}, len(allowedOrigins))
+	for _, origin := range allowedOrigins {
+		if origin = strings.TrimSpace(origin); origin != "" {
+			allowed[strings.ToLower(origin)] = struct{}{}
+		}
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := strings.TrimSpace(r.Header.Get("Origin"))
+		if origin == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if _, ok := allowed[strings.ToLower(origin)]; !ok {
+			WriteError(w, r, Problem{Status: http.StatusForbidden, Code: "origin_forbidden", Message: "Browser origin is not allowed"})
+			return
+		}
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Add("Vary", "Origin")
+		// Retry-After is exposed so browser clients can honor 429 responses.
+		w.Header().Set("Access-Control-Expose-Headers", "X-Request-ID, Retry-After")
+		if r.Method != http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+		requestedMethod := strings.ToUpper(strings.TrimSpace(r.Header.Get("Access-Control-Request-Method")))
+		allowedMethod := false
+		for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
+			if requestedMethod == method {
+				allowedMethod = true
+				break
+			}
+		}
+		if !allowedMethod {
+			WriteError(w, r, Problem{Status: http.StatusForbidden, Code: "cors_method_forbidden", Message: "Browser request method is not allowed"})
+			return
+		}
+		allowedHeaders := map[string]struct{}{
+			"authorization": {}, "content-type": {}, "idempotency-key": {}, "x-device-id": {}, "x-request-id": {},
+		}
+		for _, header := range strings.Split(r.Header.Get("Access-Control-Request-Headers"), ",") {
+			header = strings.ToLower(strings.TrimSpace(header))
+			if header == "" {
+				continue
+			}
+			if _, ok := allowedHeaders[header]; !ok {
+				WriteError(w, r, Problem{Status: http.StatusForbidden, Code: "cors_header_forbidden", Message: "Browser request header is not allowed"})
+				return
+			}
+		}
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Idempotency-Key, X-Device-ID, X-Request-ID")
+		w.Header().Set("Access-Control-Max-Age", "600")
+		w.WriteHeader(http.StatusNoContent)
+	})
+}
+
 func AccessLog(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()

@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/netip"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -37,6 +39,7 @@ type Config struct {
 	ShutdownTimeout       time.Duration
 	AllowMemoryStore      bool
 	TrustedProxyCIDRs     []string
+	AllowedOrigins        []string
 }
 
 type WorkerConfig struct {
@@ -78,6 +81,15 @@ func Load() (Config, error) {
 		RefreshTokenTTL:       envDuration("ANT_REFRESH_TOKEN_TTL", 30*24*time.Hour),
 		ShutdownTimeout:       envDuration("ANT_SHUTDOWN_TIMEOUT", 15*time.Second),
 		AllowMemoryStore:      envBool("ANT_ALLOW_MEMORY_STORE", true),
+	}
+	allowedOrigins := strings.TrimSpace(os.Getenv("ANT_ALLOWED_ORIGINS"))
+	if allowedOrigins == "" && cfg.Environment == "development" {
+		allowedOrigins = "http://127.0.0.1:4173,http://localhost:4173,http://wails.localhost"
+	}
+	for _, item := range strings.Split(allowedOrigins, ",") {
+		if value := strings.TrimSpace(item); value != "" {
+			cfg.AllowedOrigins = append(cfg.AllowedOrigins, value)
+		}
 	}
 
 	if raw := strings.TrimSpace(os.Getenv("ANT_TRUSTED_PROXY_CIDRS")); raw != "" {
@@ -203,16 +215,7 @@ func (c Config) Validate() error {
 			problems = append(problems, "ANT_SECRET_MASTER_KEY is required outside development")
 		}
 	}
-	if c.SecretMasterKey != "" {
-		decoded, err := base64.RawStdEncoding.DecodeString(strings.TrimRight(c.SecretMasterKey, "="))
-		if err != nil || len(decoded) != 32 {
-			problems = append(problems, "ANT_SECRET_MASTER_KEY must be base64-encoded 32-byte key material")
-		}
-		developmentKey, _ := base64.StdEncoding.DecodeString(developmentSecretMasterKey)
-		if c.Environment != "development" && string(decoded) == string(developmentKey) {
-			problems = append(problems, "development secret master key is forbidden outside development")
-		}
-	}
+	problems = append(problems, secretMasterKeyProblems(c.Environment, c.SecretMasterKey)...)
 	if strings.TrimSpace(c.SecretKeyVersion) == "" {
 		problems = append(problems, "ANT_SECRET_KEY_VERSION is required")
 	}
@@ -222,10 +225,103 @@ func (c Config) Validate() error {
 	if c.DatabaseURL == "" && !c.AllowMemoryStore {
 		problems = append(problems, "ANT_DATABASE_URL is required when memory store is disabled")
 	}
+	if c.Environment != "development" && len(c.AllowedOrigins) == 0 {
+		problems = append(problems, "ANT_ALLOWED_ORIGINS is required outside development")
+	}
+	var invalidProxies []string
+	for _, value := range c.TrustedProxyCIDRs {
+		switch trustedProxyProblem(value) {
+		case "":
+		case "all":
+			problems = append(problems, "ANT_TRUSTED_PROXY_CIDRS must not trust every address (/0)")
+		default:
+			invalidProxies = append(invalidProxies, strconv.Quote(value))
+		}
+	}
+	if len(invalidProxies) > 0 {
+		problems = append(problems, "ANT_TRUSTED_PROXY_CIDRS must contain only CIDR ranges or single IP addresses; invalid: "+strings.Join(invalidProxies, ", "))
+	}
+	seenOrigins := make(map[string]struct{}, len(c.AllowedOrigins))
+	for _, origin := range c.AllowedOrigins {
+		parsed, err := url.Parse(origin)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" || origin == "*" {
+			problems = append(problems, "ANT_ALLOWED_ORIGINS must contain exact HTTP(S) origins without paths")
+			break
+		}
+		canonical := strings.ToLower(parsed.Scheme) + "://" + strings.ToLower(parsed.Host)
+		if _, exists := seenOrigins[canonical]; exists {
+			problems = append(problems, "ANT_ALLOWED_ORIGINS contains a duplicate origin")
+			break
+		}
+		seenOrigins[canonical] = struct{}{}
+	}
 	if len(problems) > 0 {
 		return errors.New(strings.Join(problems, "; "))
 	}
 	return nil
+}
+
+// ValidateSecretMasterKey applies the ANT_SECRET_MASTER_KEY rules enforced by
+// Config.Validate to key material loaded outside Load, such as the worker's
+// proxy-probe envelope key: the key must be standard base64 (padding
+// optional) that decodes to exactly 32 bytes, and the published development
+// key is forbidden outside development. Unlike Load, there is no development
+// default, so an empty key is always rejected. The value is validated as
+// given; callers should trim it the same way Load does.
+func ValidateSecretMasterKey(environment, key string) error {
+	if key == "" {
+		return errors.New("ANT_SECRET_MASTER_KEY is required")
+	}
+	if problems := secretMasterKeyProblems(environment, key); len(problems) > 0 {
+		return errors.New(strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+// secretMasterKeyProblems reports format and development-key violations for a
+// configured master key. An empty key yields no problems; whether it is
+// required is decided by the caller.
+func secretMasterKeyProblems(environment, key string) []string {
+	if key == "" {
+		return nil
+	}
+	var problems []string
+	decoded, err := base64.RawStdEncoding.DecodeString(strings.TrimRight(key, "="))
+	if err != nil || len(decoded) != 32 {
+		problems = append(problems, "ANT_SECRET_MASTER_KEY must be base64-encoded 32-byte key material")
+	}
+	developmentKey, _ := base64.StdEncoding.DecodeString(developmentSecretMasterKey)
+	if environment != "development" && string(decoded) == string(developmentKey) {
+		problems = append(problems, "development secret master key is forbidden outside development")
+	}
+	return problems
+}
+
+// trustedProxyProblem classifies an ANT_TRUSTED_PROXY_CIDRS entry: "" when it
+// is a CIDR range or a single IP address (without zone), "all" when the range
+// covers every address (which would let any client choose its own forwarded
+// address), and "invalid" otherwise. It mirrors httpx.ParseTrustedProxies.
+func trustedProxyProblem(value string) string {
+	value = strings.TrimSpace(value)
+	if strings.Contains(value, "/") {
+		prefix, err := netip.ParsePrefix(value)
+		if err != nil {
+			return "invalid"
+		}
+		bits := prefix.Bits()
+		if prefix.Addr().Is4In6() && bits >= 96 {
+			bits -= 96
+		}
+		if bits == 0 {
+			return "all"
+		}
+		return ""
+	}
+	addr, err := netip.ParseAddr(value)
+	if err != nil || addr.Zone() != "" {
+		return "invalid"
+	}
+	return ""
 }
 
 func (c Config) RedactedSummary() string {

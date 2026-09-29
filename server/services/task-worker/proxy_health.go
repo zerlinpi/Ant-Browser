@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"time"
 
+	notificationservice "github.com/zerlinpi/Ant-Browser/server/services/notification-service"
 	proxyservice "github.com/zerlinpi/Ant-Browser/server/services/proxy-service"
 	taskservice "github.com/zerlinpi/Ant-Browser/server/services/task-service"
 )
@@ -22,9 +23,13 @@ type ProxyProbe interface {
 	Probe(context.Context, proxyservice.Proxy) (proxyservice.HealthResult, error)
 }
 
-func NewProxyHealthHandler(repository ProxyHealthRepository, probe ProxyProbe) (Handler, error) {
+func NewProxyHealthHandler(repository ProxyHealthRepository, probe ProxyProbe, publishers ...NotificationPublisher) (Handler, error) {
 	if repository == nil || probe == nil {
 		return nil, errors.New("proxy health repository and probe are required")
+	}
+	var notifications NotificationPublisher
+	if len(publishers) > 0 {
+		notifications = publishers[0]
 	}
 	return func(ctx context.Context, task taskservice.Task) (map[string]interface{}, error) {
 		checkID, _ := task.Payload["checkId"].(string)
@@ -41,9 +46,31 @@ func NewProxyHealthHandler(repository ProxyHealthRepository, probe ProxyProbe) (
 		response := func(value proxyservice.HealthCheck) map[string]interface{} {
 			return map[string]interface{}{"checkId": value.ID, "status": value.Status, "ip": value.IP, "latencyMs": value.LatencyMS, "errorCode": value.ErrorCode}
 		}
+		notifyFailure := func(value proxyservice.HealthCheck) error {
+			if notifications == nil || value.CreatedBy == "" {
+				return nil
+			}
+			_, err := notifications.Publish(ctx, notificationservice.CreateInput{
+				WorkspaceID: value.WorkspaceID, RecipientUserID: value.CreatedBy,
+				EventType: "proxy.health_failed", Title: "Proxy health check failed",
+				Body: "The configured proxy could not provide a healthy exit. Review the proxy center before launching accounts.",
+				Payload: map[string]interface{}{
+					"proxyId": value.ProxyID, "checkId": value.ID,
+					"errorCode": value.ErrorCode, "connectorType": value.ConnectorType,
+					"kernel": value.Kernel,
+				},
+				IdempotencyKey: "proxy-health-failure:" + value.ID,
+			})
+			return err
+		}
 		if check.CompletedAt != nil {
 			if check.Status == "failed" && check.ErrorCode != "proxy_unreachable" {
 				return nil, Failure{Code: check.ErrorCode, Message: "Proxy health request could not execute"}
+			}
+			if check.Status == "failed" {
+				if err := notifyFailure(check); err != nil {
+					return nil, Failure{Code: "notification_publish_failed", Message: "Proxy failure notification could not be published", Retryable: true, RetryDelay: 5 * time.Second}
+				}
 			}
 			return response(check), nil
 		}
@@ -102,6 +129,11 @@ func NewProxyHealthHandler(repository ProxyHealthRepository, probe ProxyProbe) (
 		saved, err := repository.CompleteProxyHealthCheck(ctx, task.WorkspaceID, check.ID, result, time.Now().UTC())
 		if err != nil {
 			return nil, err
+		}
+		if saved.Status == "failed" {
+			if err := notifyFailure(saved); err != nil {
+				return nil, Failure{Code: "notification_publish_failed", Message: "Proxy failure notification could not be published", Retryable: true, RetryDelay: 5 * time.Second}
+			}
 		}
 		return response(saved), nil
 	}, nil

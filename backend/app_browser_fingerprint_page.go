@@ -379,6 +379,10 @@ func combineFingerprintExpectedArgs(argGroups ...[]string) []string {
 	return result
 }
 
+// fingerprintCheckExpectedArgsFromProfile derives the expected fingerprint
+// arguments for display. Arguments recovered from the OS process table are
+// used for this purpose only and are never written back to LastLaunchArgs:
+// that field is launch provenance for a process this app started and tracks.
 func (a *App) fingerprintCheckExpectedArgsFromProfile(profile *BrowserProfile) []string {
 	if profile == nil {
 		return nil
@@ -388,7 +392,6 @@ func (a *App) fingerprintCheckExpectedArgsFromProfile(profile *BrowserProfile) [
 			return args
 		}
 		if args := a.recoverBrowserLaunchArgsForProfile(profile); len(args) > 0 {
-			profile.LastLaunchArgs = append([]string{}, args...)
 			return args
 		}
 	}
@@ -403,8 +406,9 @@ func (a *App) fingerprintCheckExpectedArgsFromLockedProfile(profile *BrowserProf
 		if args := normalizeNonEmptyStrings(profile.LastLaunchArgs); len(args) > 0 {
 			return args
 		}
+		// Recovered command lines are not launch provenance; see
+		// fingerprintCheckExpectedArgsFromProfile.
 		if args := a.recoverBrowserLaunchArgsForProfile(profile); len(args) > 0 {
-			profile.LastLaunchArgs = append([]string{}, args...)
 			return args
 		}
 	}

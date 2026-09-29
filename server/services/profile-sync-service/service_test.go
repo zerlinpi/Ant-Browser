@@ -86,13 +86,67 @@ func TestProfileRevisionLeaseCommitAndConflictRecovery(t *testing.T) {
 	if _, _, err := service.CommitRevision(ctx, "user", "workspace", profile.ID, conflictPlan.Revision.ID, profilesyncservice.LeaseTokenInput{DeviceID: "device-b", Token: conflictLease.Token}); !errors.Is(err, profilesyncservice.ErrRevisionConflict) {
 		t.Fatalf("unresolved conflict commit error=%v", err)
 	}
-	resolved, err := service.ResolveConflict(ctx, "user", "workspace", profile.ID, conflictPlan.Conflict.ID, profilesyncservice.ResolveConflictInput{Resolution: "keep_local"})
-	if err != nil || resolved.Status != "resolved" {
-		t.Fatalf("resolved conflict=%+v err=%v", resolved, err)
+	// While the conflict is open nothing may pull, push or restore.
+	if _, err := service.BeginRevision(ctx, "user", "workspace", profile.ID, profilesyncservice.BeginRevisionInput{
+		DeviceID: "device-b", LeaseToken: conflictLease.Token, BaseRevisionID: secondRevision.ID, Mode: "incremental",
+		Files: []profilesyncservice.FileInput{{Path: "Default/Cookies", CiphertextSHA256: strings.Repeat("e", 64), SizeBytes: 1}},
+	}); !errors.Is(err, profilesyncservice.ErrConflictUnresolved) {
+		t.Fatalf("revision begun during an open conflict: %v", err)
 	}
-	finalProfile, finalRevision, err := service.CommitRevision(ctx, "user", "workspace", profile.ID, conflictPlan.Revision.ID, profilesyncservice.LeaseTokenInput{DeviceID: "device-b", Token: conflictLease.Token})
-	if err != nil || finalProfile.CurrentRevisionID != finalRevision.ID || finalRevision.Revision != 3 {
-		t.Fatalf("conflict recovery commit profile=%+v revision=%+v err=%v", finalProfile, finalRevision, err)
+	if err := service.ReleaseLease(ctx, "user", "workspace", profile.ID, profilesyncservice.LeaseTokenInput{DeviceID: "device-b", Token: conflictLease.Token}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.AcquireLease(ctx, "user", "workspace", profile.ID, profilesyncservice.AcquireLeaseInput{DeviceID: "device-a"}); !errors.Is(err, profilesyncservice.ErrConflictUnresolved) {
+		t.Fatalf("lease granted during an open conflict: %v", err)
+	}
+	if conflicted, err := service.GetProfile(ctx, "user", "workspace", profile.ID); err != nil || conflicted.Status != "conflict" {
+		t.Fatalf("profile status after release = %+v, %v; want conflict", conflicted, err)
+	}
+	// An incremental conflict revision cannot become current on its own:
+	// its delta applies to a base that is no longer current.
+	if _, err := service.ResolveConflict(ctx, "user", "workspace", profile.ID, conflictPlan.Conflict.ID, profilesyncservice.ResolveConflictInput{Resolution: "keep_local"}); !errors.Is(err, profilesyncservice.ErrRevisionState) {
+		t.Fatalf("incremental conflict revision promoted: %v", err)
+	}
+	discarded, err := service.ResolveConflict(ctx, "user", "workspace", profile.ID, conflictPlan.Conflict.ID, profilesyncservice.ResolveConflictInput{Resolution: "keep_remote"})
+	if err != nil || discarded.Status != "resolved" || discarded.Resolution != "keep_remote" {
+		t.Fatalf("keep_remote conflict=%+v err=%v", discarded, err)
+	}
+	if afterRemote, err := service.GetProfile(ctx, "user", "workspace", profile.ID); err != nil || afterRemote.Status != "active" || afterRemote.CurrentRevisionID != secondRevision.ID {
+		t.Fatalf("keep_remote changed the current revision: %+v, %v", afterRemote, err)
+	}
+
+	// A full snapshot uploaded from a stale base can be kept: it becomes the
+	// current revision once no device is mid-transfer.
+	snapshotLease, err := service.AcquireLease(ctx, "user", "workspace", profile.ID, profilesyncservice.AcquireLeaseInput{DeviceID: "device-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotPlan, err := service.BeginRevision(ctx, "user", "workspace", profile.ID, profilesyncservice.BeginRevisionInput{
+		DeviceID: "device-b", LeaseToken: snapshotLease.Token, BaseRevisionID: firstRevision.ID, Mode: "snapshot",
+		Files: []profilesyncservice.FileInput{{Path: "profile.zip.enc", CiphertextSHA256: strings.Repeat("f", 64), SizeBytes: 4096}},
+	})
+	if err != nil || snapshotPlan.Conflict == nil {
+		t.Fatalf("stale snapshot plan=%+v err=%v", snapshotPlan, err)
+	}
+	if _, err := service.ResolveConflict(ctx, "user", "workspace", profile.ID, snapshotPlan.Conflict.ID, profilesyncservice.ResolveConflictInput{Resolution: "keep_local"}); !errors.Is(err, profilesyncservice.ErrLeaseHeld) {
+		t.Fatalf("keep_local ran while a device held the lease: %v", err)
+	}
+	if err := service.ReleaseLease(ctx, "user", "workspace", profile.ID, profilesyncservice.LeaseTokenInput{DeviceID: "device-b", Token: snapshotLease.Token}); err != nil {
+		t.Fatal(err)
+	}
+	kept, err := service.ResolveConflict(ctx, "user", "workspace", profile.ID, snapshotPlan.Conflict.ID, profilesyncservice.ResolveConflictInput{Resolution: "keep_local"})
+	if err != nil || kept.Status != "resolved" || kept.Resolution != "keep_local" {
+		t.Fatalf("keep_local conflict=%+v err=%v", kept, err)
+	}
+	finalProfile, err := service.GetProfile(ctx, "user", "workspace", profile.ID)
+	if err != nil || finalProfile.CurrentRevisionID != snapshotPlan.Revision.ID || finalProfile.Status != "active" {
+		t.Fatalf("keep_local did not promote the snapshot: %+v, %v", finalProfile, err)
+	}
+	if promoted, err := service.GetRevision(ctx, "user", "workspace", profile.ID, snapshotPlan.Revision.ID); err != nil || promoted.Revision.Status != "committed" {
+		t.Fatalf("promoted revision = %+v, %v", promoted.Revision, err)
+	}
+	if replaced, err := service.GetRevision(ctx, "user", "workspace", profile.ID, secondRevision.ID); err != nil || replaced.Revision.Status != "superseded" {
+		t.Fatalf("replaced remote revision = %+v, %v", replaced.Revision, err)
 	}
 	snapshot, err := service.GetRevision(ctx, "user", "workspace", profile.ID, firstRevision.ID)
 	if err != nil || snapshot.Revision.Status != "superseded" || len(snapshot.Objects) != 2 {
@@ -112,6 +166,42 @@ func TestProfileRevisionLeaseCommitAndConflictRecovery(t *testing.T) {
 	)
 	if err != nil || restoredProfile.CurrentRevisionID != firstRevision.ID || restoredRevision.Status != "committed" {
 		t.Fatalf("historical restore profile=%+v revision=%+v err=%v", restoredProfile, restoredRevision, err)
+	}
+}
+
+func TestDeviceReclaimsOnlyItsOwnActiveLease(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := memory.New()
+	seedProfileWorkspace(t, store)
+	service := profilesyncservice.New(store, allowAuthorizer{}, security.NewOpaqueToken, profilesyncservice.MetadataVerifier{}, "key", "memory-test")
+	profile, err := service.CreateProfile(ctx, "user", "workspace", profilesyncservice.CreateProfileInput{Name: "Profile"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deviceA := memberservice.WithDeviceAuthorization(ctx, "workspace", "device-a", memberservice.PermissionProfileRead, memberservice.PermissionProfileSync)
+	lost, err := service.AcquireLease(deviceA, "", "workspace", profile.ID, profilesyncservice.AcquireLeaseInput{DeviceID: "device-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A workspace user naming the device must not preempt its transfer.
+	if _, err := service.AcquireLease(ctx, "user", "workspace", profile.ID, profilesyncservice.AcquireLeaseInput{DeviceID: "device-a"}); !errors.Is(err, profilesyncservice.ErrLeaseHeld) {
+		t.Fatalf("user preempted a device lease: %v", err)
+	}
+	deviceB := memberservice.WithDeviceAuthorization(ctx, "workspace", "device-b", memberservice.PermissionProfileRead, memberservice.PermissionProfileSync)
+	if _, err := service.AcquireLease(deviceB, "", "workspace", profile.ID, profilesyncservice.AcquireLeaseInput{DeviceID: "device-b"}); !errors.Is(err, profilesyncservice.ErrLeaseHeld) {
+		t.Fatalf("another device took the lease: %v", err)
+	}
+	// After a crash the device lost its token; it may replace its own lease.
+	reclaimed, err := service.AcquireLease(deviceA, "", "workspace", profile.ID, profilesyncservice.AcquireLeaseInput{DeviceID: "device-a"})
+	if err != nil || reclaimed.Token == lost.Token {
+		t.Fatalf("device could not reclaim its own lease: %+v, %v", reclaimed, err)
+	}
+	if _, err := service.RenewLease(deviceA, "", "workspace", profile.ID, profilesyncservice.LeaseTokenInput{DeviceID: "device-a", Token: lost.Token}, time.Minute); !errors.Is(err, profilesyncservice.ErrLeaseInvalid) {
+		t.Fatalf("the replaced token still renews: %v", err)
+	}
+	if _, err := service.RenewLease(deviceA, "", "workspace", profile.ID, profilesyncservice.LeaseTokenInput{DeviceID: "device-a", Token: reclaimed.Token}, time.Minute); err != nil {
+		t.Fatalf("the reclaimed token does not renew: %v", err)
 	}
 }
 

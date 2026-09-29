@@ -21,6 +21,7 @@ import (
 	deviceservice "github.com/zerlinpi/Ant-Browser/server/services/device-service"
 	fingerprintservice "github.com/zerlinpi/Ant-Browser/server/services/fingerprint-service"
 	gatewayservice "github.com/zerlinpi/Ant-Browser/server/services/gateway-service"
+	profilesyncservice "github.com/zerlinpi/Ant-Browser/server/services/profile-sync-service"
 	taskservice "github.com/zerlinpi/Ant-Browser/server/services/task-service"
 	workspaceservice "github.com/zerlinpi/Ant-Browser/server/services/workspace-service"
 )
@@ -122,6 +123,116 @@ func TestAgentWebSocketRejectsInvalidCredential(t *testing.T) {
 	}
 	if err == nil || response == nil || response.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("invalid credential handshake response=%v err=%v", response, err)
+	}
+}
+
+func TestAgentRuntimeConfigIsScopedToAssignedDevice(t *testing.T) {
+	t.Parallel()
+	handler := newTestGateway()
+	owner := register(t, handler, "agent-runtime-owner@example.com")
+	workspace := createTestWorkspace(t, handler, owner.AccessToken)
+	device := createTestDevice(t, handler, owner.AccessToken, workspace.ID)
+	otherDevice := createTestDevice(t, handler, owner.AccessToken, workspace.ID)
+	seed := int64(424242)
+	createTemplate := perform(t, handler, http.MethodPost, "/api/v1/workspaces/"+workspace.ID+"/fingerprint-templates", owner.AccessToken, "", map[string]interface{}{
+		"name": "Runtime template", "mode": "fixed", "browserMajor": 144, "platform": "windows",
+		"seed": "424242", "locale": "en-US", "timezone": "America/New_York",
+		"configuration": map[string]interface{}{
+			"hardwareConcurrency": 8, "deviceMemory": 8, "screenWidth": 1920, "screenHeight": 1080,
+			"canvasNoise": true, "clientRectsNoise": true,
+		},
+	})
+	assertStatus(t, createTemplate, http.StatusCreated)
+	template := decodeData[fingerprintservice.Template](t, createTemplate)
+	createInstance := perform(t, handler, http.MethodPost, "/api/v1/workspaces/"+workspace.ID+"/browser-instances", owner.AccessToken, "", map[string]interface{}{
+		"name": "Runtime instance", "platform": "chromium", "assignedDeviceId": device.Data.Device.ID,
+		"fingerprintTemplateId": template.ID,
+	})
+	assertStatus(t, createInstance, http.StatusCreated)
+	instance := decodeData[browserinstanceservice.BrowserInstance](t, createInstance)
+
+	path := "/api/v1/agent/instances/" + instance.ID + "/runtime-config"
+	response := performDevice(t, handler, http.MethodGet, path, device.Data.Device.ID, device.Data.Credential, nil)
+	assertStatus(t, response, http.StatusOK)
+	resolved := decodeData[struct {
+		InstanceID  string                       `json:"instanceId"`
+		Fingerprint *fingerprintservice.Template `json:"fingerprint"`
+	}](t, response)
+	if resolved.InstanceID != instance.ID || resolved.Fingerprint == nil || resolved.Fingerprint.ID != template.ID ||
+		resolved.Fingerprint.Seed != seed || resolved.Fingerprint.Configuration.DeviceMemory != 8 {
+		t.Fatalf("runtime config = %+v", resolved)
+	}
+
+	denied := performDevice(t, handler, http.MethodGet, path, otherDevice.Data.Device.ID, otherDevice.Data.Credential, nil)
+	assertStatus(t, denied, http.StatusNotFound)
+
+	plainInstance := createTestInstance(t, handler, owner.AccessToken, workspace.ID, device.Data.Device.ID)
+	plain := performDevice(t, handler, http.MethodGet, "/api/v1/agent/instances/"+plainInstance.ID+"/runtime-config", device.Data.Device.ID, device.Data.Credential, nil)
+	assertStatus(t, plain, http.StatusOK)
+	withoutTemplate := decodeData[struct {
+		InstanceID  string                       `json:"instanceId"`
+		Fingerprint *fingerprintservice.Template `json:"fingerprint"`
+	}](t, plain)
+	if withoutTemplate.InstanceID != plainInstance.ID || withoutTemplate.Fingerprint != nil {
+		t.Fatalf("runtime config without template = %+v", withoutTemplate)
+	}
+
+	revoke := perform(t, handler, http.MethodDelete, "/api/v1/devices/"+device.Data.Device.ID, owner.AccessToken, "", nil)
+	assertStatus(t, revoke, http.StatusNoContent)
+	revoked := performDevice(t, handler, http.MethodGet, path, device.Data.Device.ID, device.Data.Credential, nil)
+	assertStatus(t, revoked, http.StatusUnauthorized)
+}
+
+func TestMigrationCompletionDispatchesDestinationStart(t *testing.T) {
+	t.Parallel()
+	handler := newTestGateway()
+	owner := register(t, handler, "migration-agent-owner@example.com")
+	workspace := createTestWorkspace(t, handler, owner.AccessToken)
+	source := createTestDevice(t, handler, owner.AccessToken, workspace.ID)
+	target := createTestDevice(t, handler, owner.AccessToken, workspace.ID)
+	profileResponse := perform(t, handler, http.MethodPost, "/api/v1/workspaces/"+workspace.ID+"/profiles", owner.AccessToken, "", map[string]string{"name": "Migrated profile"})
+	assertStatus(t, profileResponse, http.StatusCreated)
+	profile := decodeData[profilesyncservice.Profile](t, profileResponse)
+	instanceResponse := perform(t, handler, http.MethodPost, "/api/v1/workspaces/"+workspace.ID+"/browser-instances", owner.AccessToken, "", map[string]interface{}{
+		"name": "Migrated instance", "platform": "chromium", "assignedDeviceId": source.Data.Device.ID, "profileId": profile.ID,
+	})
+	assertStatus(t, instanceResponse, http.StatusCreated)
+	instance := decodeData[browserinstanceservice.BrowserInstance](t, instanceResponse)
+
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	sourceConnection := dialTestAgent(t, server.URL, source.Data.Device.ID, source.Data.Credential)
+	defer sourceConnection.Close()
+	targetConnection := dialTestAgent(t, server.URL, target.Data.Device.ID, target.Data.Credential)
+	defer targetConnection.Close()
+	if readAgentEnvelope(t, sourceConnection).Type != "server.hello" || readAgentEnvelope(t, targetConnection).Type != "server.hello" {
+		t.Fatal("agent handshake failed")
+	}
+
+	migrateResponse := perform(t, handler, http.MethodPost, "/api/v1/workspaces/"+workspace.ID+"/browser-instances/"+instance.ID+"/commands", owner.AccessToken, "migration-agent-flow", map[string]interface{}{
+		"action": "instance.migrate", "expectedVersion": instance.Version,
+		"payload": map[string]interface{}{"targetDeviceId": target.Data.Device.ID},
+	})
+	assertStatus(t, migrateResponse, http.StatusAccepted)
+	sourceDispatch := readAgentEnvelope(t, sourceConnection)
+	var migration browserinstanceservice.Command
+	if sourceDispatch.Type != "command.dispatch" || json.Unmarshal(sourceDispatch.Payload, &migration) != nil || migration.Action != "instance.migrate" {
+		t.Fatalf("invalid migration dispatch: %+v", sourceDispatch)
+	}
+	writeAgentMessage(t, sourceConnection, "migration-completed", "command.completed", map[string]string{"commandId": migration.ID})
+	targetDispatch := readAgentEnvelope(t, targetConnection)
+	var start browserinstanceservice.Command
+	if targetDispatch.Type != "command.dispatch" || json.Unmarshal(targetDispatch.Payload, &start) != nil ||
+		start.Action != "instance.start" || start.DeviceID != target.Data.Device.ID ||
+		start.IdempotencyKey != browserinstanceservice.MigrationStartIdempotencyKey(migration.ID) {
+		t.Fatalf("invalid destination start dispatch: envelope=%+v command=%+v", targetDispatch, start)
+	}
+	assertAgentAck(t, sourceConnection, "migration-completed")
+	instanceState := perform(t, handler, http.MethodGet, "/api/v1/workspaces/"+workspace.ID+"/browser-instances/"+instance.ID, owner.AccessToken, "", nil)
+	assertStatus(t, instanceState, http.StatusOK)
+	migrated := decodeData[browserinstanceservice.BrowserInstance](t, instanceState)
+	if migrated.AssignedDeviceID != target.Data.Device.ID || migrated.DesiredState != "running" {
+		t.Fatalf("instance was not assigned to destination: %+v", migrated)
 	}
 }
 

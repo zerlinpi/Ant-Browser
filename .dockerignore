@@ -1,0 +1,69 @@
+# Build context for deploy/docker/*/Dockerfile. Compose builds every image with
+# the repository root as context, so this file decides what reaches the Docker
+# daemon or a remote builder.
+#
+# It is an ALLOWLIST: exclude everything, then re-include exactly the paths the
+# Dockerfiles COPY. When a Dockerfile starts copying a new path, add a "!" rule
+# below; the CI "containers" job builds every image, so a missing rule fails
+# fast with "not found" instead of silently shipping extra files.
+#
+#   control-plane: server/, database/migrations/
+#   worker:        server/, database/migrations/, go.mod, go.sum, backend/
+#   frontend:      desktop/vue3-ui/, frontend/src/resources/images/logo.png,
+#                  deploy/nginx/frontend.conf
+#
+# Everything else stays out, notably .git, .codex-tmp, bin/ (~350 MB of
+# git-tracked xray/sing-box connector binaries), local browser profiles and
+# runtime data, publish/ and build/ outputs, and deploy/.env*. Compose reads
+# deploy/.env and deploy/.env.example on the client; no image copies them.
+*
+
+!server/
+!database/migrations/
+!go.mod
+!go.sum
+!backend/
+!desktop/vue3-ui/
+!frontend/src/resources/images/logo.png
+!deploy/nginx/frontend.conf
+
+# ---------------------------------------------------------------------------
+# Hard excludes. Keep these AFTER the re-includes: the last matching rule wins,
+# so they also apply inside re-included directories and cannot be undone by a
+# "!" rule added above.
+
+# Host dependency trees and tool caches. Images run npm ci / go mod download
+# themselves, and host node_modules can contain platform-specific binaries.
+**/node_modules
+**/.vite
+**/coverage
+
+# Secrets and machine-local overrides, at any depth.
+**/.env
+**/.env.*
+**/*.local
+**/*.local.json
+**/*.local.yaml
+**/*.local.yml
+
+# Local runtime data, logs and build/test artifacts.
+**/*.log
+**/*.db
+**/*.db-*
+**/*.sqlite
+**/*.sqlite3
+**/*.test
+**/*.out
+**/*.exe
+**/.DS_Store
+
+# Connector binaries, browser cores/profiles and user data must never enter a
+# cloud image build context. Already excluded by "*"; listed so that no future
+# re-include can pull them back in.
+bin
+connectors
+browser-cores
+browser-data
+user-data
+data
+chrome

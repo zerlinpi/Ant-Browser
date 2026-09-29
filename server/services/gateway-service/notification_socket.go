@@ -23,6 +23,9 @@ const (
 	notificationPongWait     = 60 * time.Second
 	notificationPingPeriod   = 25 * time.Second
 	notificationMaxMessage   = 1 << 20
+	// notificationSessionCheck bounds how long a socket outlives its session
+	// when the session is revoked on another node or simply expires.
+	notificationSessionCheck = time.Minute
 )
 
 type notificationHub struct {
@@ -33,6 +36,7 @@ type notificationHub struct {
 type notificationClient struct {
 	workspaceID string
 	userID      string
+	sessionID   string
 	conn        *websocket.Conn
 	send        chan []byte
 	done        chan struct{}
@@ -65,6 +69,31 @@ func (h *notificationHub) unregister(client *notificationClient) {
 		delete(h.clients, key)
 	}
 	h.mu.Unlock()
+}
+
+// closeSessions closes this node's sockets opened by the given sessions of
+// one user, in every workspace.
+func (h *notificationHub) closeSessions(userID string, sessionIDs ...string) {
+	if len(sessionIDs) == 0 {
+		return
+	}
+	revoked := make(map[string]struct{}, len(sessionIDs))
+	for _, id := range sessionIDs {
+		revoked[id] = struct{}{}
+	}
+	h.mu.RLock()
+	var clients []*notificationClient
+	for _, set := range h.clients {
+		for client := range set {
+			if _, ok := revoked[client.sessionID]; ok && client.userID == userID {
+				clients = append(clients, client)
+			}
+		}
+	}
+	h.mu.RUnlock()
+	for _, client := range clients {
+		client.close()
+	}
 }
 
 func (h *notificationHub) dispatch(value realtime.UserNotification) {
@@ -147,14 +176,14 @@ func (g *Gateway) notificationSocket(w http.ResponseWriter, r *http.Request) {
 	upgrader := websocket.Upgrader{
 		HandshakeTimeout: notificationWriteWait,
 		ReadBufferSize:   4096, WriteBufferSize: 4096,
-		Subprotocols: []string{notificationSubprotocol}, CheckOrigin: agentOriginAllowed,
+		Subprotocols: []string{notificationSubprotocol}, CheckOrigin: g.originAllowed,
 	}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
 	client := &notificationClient{
-		workspaceID: claims.WorkspaceID, userID: claims.UserID, conn: conn,
+		workspaceID: claims.WorkspaceID, userID: claims.UserID, sessionID: claims.SessionID, conn: conn,
 		send: make(chan []byte, 128), done: make(chan struct{}),
 	}
 	g.notificationHub.register(client)
@@ -163,6 +192,7 @@ func (g *Gateway) notificationSocket(w http.ResponseWriter, r *http.Request) {
 		client.close()
 	}()
 	go client.writePump()
+	go g.watchNotificationSession(ctx, client)
 	hello, _ := json.Marshal(map[string]interface{}{
 		"type": "server.hello", "sentAt": time.Now().UTC(),
 		"data": map[string]string{"workspaceId": claims.WorkspaceID, "protocol": notificationSubprotocol},
@@ -171,6 +201,25 @@ func (g *Gateway) notificationSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	client.readPump()
+}
+
+// watchNotificationSession closes the socket once its session is no longer
+// active. Revocations on this node close sockets at once (closeSessions);
+// this check covers other nodes and expiry.
+func (g *Gateway) watchNotificationSession(ctx context.Context, client *notificationClient) {
+	ticker := time.NewTicker(notificationSessionCheck)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-client.done:
+			return
+		case <-ticker.C:
+			if err := g.auth.ValidateSession(ctx, client.userID, client.sessionID); err != nil {
+				client.close()
+				return
+			}
+		}
+	}
 }
 
 func (g *Gateway) subscribeNotifications(ctx context.Context) {

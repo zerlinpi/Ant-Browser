@@ -1,7 +1,7 @@
 <template>
   <Teleport to="body">
     <div v-if="open" class="modal-backdrop" role="presentation" @mousedown.self="$emit('close')">
-      <section class="modal-panel" role="dialog" aria-modal="true" :aria-labelledby="titleId">
+      <section class="modal-panel" :class="{ 'modal-panel-wide': wide }" role="dialog" aria-modal="true" :aria-labelledby="titleId">
         <header class="modal-header">
           <div>
             <h2 :id="titleId">{{ title }}</h2>
@@ -22,7 +22,7 @@
 import { computed, onBeforeUnmount, onMounted } from "vue";
 import { Icon } from "@iconify/vue";
 
-const props = defineProps<{ open: boolean; title: string; description?: string }>();
+const props = defineProps<{ open: boolean; title: string; description?: string; wide?: boolean }>();
 const emit = defineEmits<{ close: [] }>();
 const titleId = computed(() => `modal-${props.title.replace(/\s+/g, "-").toLowerCase()}`);
 const onKeydown = (event: KeyboardEvent) => { if (event.key === "Escape" && props.open) emit("close"); };

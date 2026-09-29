@@ -36,6 +36,33 @@ func (g *Gateway) createFingerprintTemplate(w http.ResponseWriter, r *http.Reque
 	httpx.WriteJSON(w, http.StatusCreated, map[string]interface{}{"data": template})
 }
 
+func (g *Gateway) createFingerprintTemplateBatch(w http.ResponseWriter, r *http.Request) {
+	var input fingerprintservice.BatchCreateInput
+	if err := httpx.DecodeJSON(w, r, &input); err != nil {
+		httpx.WriteError(w, r, err)
+		return
+	}
+	templates, err := g.fingerprints.CreateBatch(
+		r.Context(), mustPrincipal(r.Context()).UserID, r.PathValue("workspaceID"), input,
+	)
+	if err != nil {
+		g.writeServiceError(w, r, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusCreated, map[string]interface{}{"data": templates})
+}
+
+func (g *Gateway) listFingerprintPresets(w http.ResponseWriter, r *http.Request) {
+	presets, err := g.fingerprints.ListPresets(
+		r.Context(), mustPrincipal(r.Context()).UserID, r.PathValue("workspaceID"),
+	)
+	if err != nil {
+		g.writeServiceError(w, r, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]interface{}{"data": presets})
+}
+
 func (g *Gateway) getFingerprintTemplate(w http.ResponseWriter, r *http.Request) {
 	template, err := g.fingerprints.Get(
 		r.Context(), mustPrincipal(r.Context()).UserID,

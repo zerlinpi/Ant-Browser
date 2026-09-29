@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	profilesyncservice "github.com/zerlinpi/Ant-Browser/server/services/profile-sync-service"
 )
 
@@ -47,8 +46,8 @@ func (s *Store) CreateCloudProfile(ctx context.Context, profile profilesyncservi
 	`, profile.ID, profile.WorkspaceID, profile.OwnerUserID, profile.Name,
 		profile.FingerprintTemplateID, profile.CurrentRevisionID, profile.Status,
 		profile.Version, profile.CreatedAt, profile.UpdatedAt, profile.DeletedAt)
-	if isUniqueViolation(err) {
-		return errors.New("cloud profile name already exists")
+	if isUniqueViolationOn(err, profileNameIndex) {
+		return profilesyncservice.ErrNameConflict
 	}
 	if isForeignKeyViolation(err) {
 		return profilesyncservice.ErrNotFound
@@ -84,7 +83,7 @@ func (s *Store) ListCloudProfiles(ctx context.Context, workspaceID string) ([]pr
 	return items, rows.Err()
 }
 
-func (s *Store) AcquireProfileLease(ctx context.Context, lease profilesyncservice.Lease, hash string, now time.Time) error {
+func (s *Store) AcquireProfileLease(ctx context.Context, lease profilesyncservice.Lease, hash string, reclaimOwn bool, now time.Time) error {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
 		return err
@@ -96,6 +95,24 @@ func (s *Store) AcquireProfileLease(ctx context.Context, lease profilesyncservic
 		FOR UPDATE OF p
 	`, lease.WorkspaceID, lease.ProfileID)); err != nil {
 		return err
+	}
+	if open, err := openProfileConflict(ctx, tx, lease.WorkspaceID, lease.ProfileID); err != nil {
+		return err
+	} else if open {
+		return profilesyncservice.ErrConflictUnresolved
+	}
+	if reclaimOwn {
+		// The device lost its token (for example it crashed mid-sync). Any
+		// operation still using the old token fails its lease check, so
+		// replacing the lease cannot commit a half-finished transfer.
+		if _, err := tx.Exec(ctx, `
+			UPDATE profile_sync_leases
+			SET released_at = $4
+			WHERE workspace_id = $1::uuid AND profile_id = $2::uuid
+			  AND holder_device_id = $3::uuid AND released_at IS NULL
+		`, lease.WorkspaceID, lease.ProfileID, lease.HolderDeviceID, now); err != nil {
+			return err
+		}
 	}
 	var deviceExists bool
 	if err := tx.QueryRow(ctx, `
@@ -246,6 +263,11 @@ func (s *Store) BeginProfileRevision(
 	if err := requireProfileLease(ctx, tx, revision.WorkspaceID, revision.ProfileID, revision.DeviceID, leaseHash, now); err != nil {
 		return profilesyncservice.Revision{}, profilesyncservice.Profile{}, nil, err
 	}
+	if open, err := openProfileConflict(ctx, tx, revision.WorkspaceID, revision.ProfileID); err != nil {
+		return profilesyncservice.Revision{}, profilesyncservice.Profile{}, nil, err
+	} else if open {
+		return profilesyncservice.Revision{}, profilesyncservice.Profile{}, nil, profilesyncservice.ErrConflictUnresolved
+	}
 	if profile.CurrentRevisionID == "" && revision.BaseRevisionID != "" {
 		return profilesyncservice.Revision{}, profilesyncservice.Profile{}, nil, profilesyncservice.ErrRevisionConflict
 	}
@@ -287,24 +309,7 @@ func (s *Store) BeginProfileRevision(
 	if err != nil {
 		return profilesyncservice.Revision{}, profilesyncservice.Profile{}, nil, err
 	}
-	rows := make([][]interface{}, 0, len(objects))
-	for _, object := range objects {
-		decodedHash, decodeErr := hex.DecodeString(object.ContentHash)
-		if decodeErr != nil {
-			return profilesyncservice.Revision{}, profilesyncservice.Profile{}, nil, decodeErr
-		}
-		rows = append(rows, []interface{}{
-			object.ID, object.WorkspaceID, object.RevisionID, object.ObjectKey,
-			decodedHash, object.SizeBytes, object.StorageBackend, object.Encrypted,
-			object.EncryptionKeyRef, object.ContentType, object.CreatedAt,
-		})
-	}
-	_, err = tx.CopyFrom(
-		ctx, pgx.Identifier{"profile_objects"},
-		[]string{"id", "workspace_id", "revision_id", "object_key", "content_hash", "size_bytes", "storage_backend", "encrypted", "encryption_key_ref", "content_type", "created_at"},
-		pgx.CopyFromRows(rows),
-	)
-	if err != nil {
+	if err := insertProfileObjects(ctx, tx, objects); err != nil {
 		return profilesyncservice.Revision{}, profilesyncservice.Profile{}, nil, err
 	}
 	var conflict *profilesyncservice.Conflict
@@ -418,8 +423,30 @@ func (s *Store) LoadProfileRevisionSnapshot(ctx context.Context, workspaceID, pr
 	return profilesyncservice.RevisionPlan{Revision: revision, Manifest: manifest, Objects: objects}, nil
 }
 
-func (s *Store) CommitProfileRevision(ctx context.Context, workspaceID, profileID, revisionID, deviceID, leaseHash string, now time.Time) (profilesyncservice.Profile, profilesyncservice.Revision, error) {
+// withProfileOrganizationScope adds the workspace's organization to the
+// tenant scope. The storage entitlement and the profile storage ledger are
+// organization-scoped under RLS, while profile routes carry only a workspace
+// scope; without the organization the quota check would see no entitlement
+// and fail closed for every commit.
+func (s *Store) withProfileOrganizationScope(ctx context.Context, workspaceID string) (context.Context, error) {
 	ctx = WithTenantScope(ctx, TenantScope{WorkspaceID: workspaceID})
+	var organizationID string
+	if err := s.pool.QueryRow(ctx, `
+		SELECT organization_id::text FROM workspaces WHERE id = $1::uuid
+	`, workspaceID).Scan(&organizationID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ctx, profilesyncservice.ErrNotFound
+		}
+		return ctx, err
+	}
+	return WithTenantScope(ctx, TenantScope{OrganizationID: organizationID}), nil
+}
+
+func (s *Store) CommitProfileRevision(ctx context.Context, workspaceID, profileID, revisionID, deviceID, leaseHash string, now time.Time) (profilesyncservice.Profile, profilesyncservice.Revision, error) {
+	ctx, err := s.withProfileOrganizationScope(ctx, workspaceID)
+	if err != nil {
+		return profilesyncservice.Profile{}, profilesyncservice.Revision{}, err
+	}
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
 		return profilesyncservice.Profile{}, profilesyncservice.Revision{}, err
@@ -608,7 +635,7 @@ func (s *Store) RestoreProfileRevision(ctx context.Context, workspaceID, profile
 			workspace_id, actor_user_id, actor_device_id, action,
 			resource_type, resource_id, outcome, metadata, created_at
 		) VALUES (
-			$1::uuid, $2::uuid, $3::uuid, 'profile.revision.restore',
+			$1::uuid, NULLIF($2, '')::uuid, $3::uuid, 'profile.revision.restore',
 			'browser_profile', $4::uuid, 'success',
 			jsonb_build_object('revisionId', $5::text), $6
 		)
@@ -670,6 +697,11 @@ func (s *Store) ListProfileConflicts(ctx context.Context, workspaceID, profileID
 }
 
 func (s *Store) ResolveProfileConflict(ctx context.Context, workspaceID, profileID, conflictID, resolution, actorID string, now time.Time) (profilesyncservice.Conflict, error) {
+	// keep_local charges the promoted snapshot to the organization ledger.
+	ctx, err := s.withProfileOrganizationScope(ctx, workspaceID)
+	if err != nil {
+		return profilesyncservice.Conflict{}, err
+	}
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
 		return profilesyncservice.Conflict{}, err
@@ -691,56 +723,226 @@ func (s *Store) ResolveProfileConflict(ctx context.Context, workspaceID, profile
 	if err != nil {
 		return profilesyncservice.Conflict{}, err
 	}
-	if conflict.Status != "open" || profile.CurrentRevisionID != conflict.RemoteRevisionID {
+	if conflict.Status != "open" {
 		return profilesyncservice.Conflict{}, profilesyncservice.ErrRevisionState
 	}
-	profileStatus := "active"
-	var revisionTag pgconn.CommandTag
-	switch resolution {
-	case "keep_local":
-		revisionTag, err = tx.Exec(ctx, `
-			UPDATE profile_revisions
-			SET base_revision_id = $4::uuid
-			WHERE workspace_id = $1::uuid AND profile_id = $2::uuid
-			  AND id = $3::uuid AND status = 'uploading'
-		`, workspaceID, profileID, conflict.LocalRevisionID, conflict.RemoteRevisionID)
-		profileStatus = "syncing"
-	case "keep_remote":
-		revisionTag, err = tx.Exec(ctx, `
-			UPDATE profile_revisions SET status = 'superseded'
-			WHERE workspace_id = $1::uuid AND profile_id = $2::uuid
-			  AND id = $3::uuid AND status = 'uploading'
-		`, workspaceID, profileID, conflict.LocalRevisionID)
-	default:
-		return profilesyncservice.Conflict{}, profilesyncservice.ErrRevisionState
-	}
+	local, err := scanProfileRevision(tx.QueryRow(ctx, `
+		SELECT `+profileRevisionColumns+` FROM profile_revisions r
+		WHERE r.workspace_id = $1::uuid AND r.profile_id = $2::uuid AND r.id = $3::uuid
+		FOR UPDATE OF r
+	`, workspaceID, profileID, conflict.LocalRevisionID))
 	if err != nil {
 		return profilesyncservice.Conflict{}, err
 	}
-	if revisionTag.RowsAffected() != 1 {
+	switch resolution {
+	case "keep_local":
+		// The service verified the local snapshot's objects before this
+		// transaction. Promotion also requires that nothing newer was
+		// committed and that no device is mid-transfer under a lease.
+		if local.Status != "uploading" || profile.CurrentRevisionID != conflict.RemoteRevisionID {
+			return profilesyncservice.Conflict{}, profilesyncservice.ErrRevisionState
+		}
+		manifest, err := scanProfileManifest(tx.QueryRow(ctx, `
+			SELECT manifest_json FROM profile_manifests WHERE revision_id = $1::uuid
+		`, local.ID))
+		if err != nil {
+			return profilesyncservice.Conflict{}, err
+		}
+		if manifest.Mode != "snapshot" {
+			return profilesyncservice.Conflict{}, profilesyncservice.ErrRevisionState
+		}
+		var leased bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM profile_sync_leases
+				WHERE workspace_id = $1::uuid AND profile_id = $2::uuid
+				  AND released_at IS NULL AND expires_at > $3
+			)
+		`, workspaceID, profileID, now).Scan(&leased); err != nil {
+			return profilesyncservice.Conflict{}, err
+		}
+		if leased {
+			return profilesyncservice.Conflict{}, profilesyncservice.ErrLeaseHeld
+		}
+		if err := applyProfileStorageQuota(ctx, tx, profile, local, local.ID, now); err != nil {
+			return profilesyncservice.Conflict{}, err
+		}
+		if profile.CurrentRevisionID != "" {
+			if _, err := tx.Exec(ctx, `
+				UPDATE profile_revisions SET status = 'superseded'
+				WHERE workspace_id = $1::uuid AND profile_id = $2::uuid
+				  AND id = $3::uuid AND status = 'committed'
+			`, workspaceID, profileID, profile.CurrentRevisionID); err != nil {
+				return profilesyncservice.Conflict{}, err
+			}
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE profile_revisions SET status = 'committed', committed_at = $4
+			WHERE workspace_id = $1::uuid AND profile_id = $2::uuid AND id = $3::uuid
+		`, workspaceID, profileID, local.ID, now); err != nil {
+			return profilesyncservice.Conflict{}, err
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE browser_profiles SET current_revision_id = $3::uuid
+			WHERE workspace_id = $1::uuid AND id = $2::uuid
+		`, workspaceID, profileID, local.ID); err != nil {
+			return profilesyncservice.Conflict{}, err
+		}
+	case "keep_remote":
+		// An interrupted upload may never have produced objects; discarding
+		// the local revision is always safe because it was never current.
+		if local.Status == "uploading" {
+			if _, err := tx.Exec(ctx, `
+				UPDATE profile_revisions SET status = 'superseded'
+				WHERE workspace_id = $1::uuid AND profile_id = $2::uuid AND id = $3::uuid
+			`, workspaceID, profileID, local.ID); err != nil {
+				return profilesyncservice.Conflict{}, err
+			}
+		}
+	default:
 		return profilesyncservice.Conflict{}, profilesyncservice.ErrRevisionState
 	}
 	conflict, err = scanProfileConflict(tx.QueryRow(ctx, `
 		UPDATE profile_conflicts AS c
 		SET status = 'resolved', resolution = $4,
-		    resolved_by = $5::uuid, resolved_at = $6
+		    resolved_by = NULLIF($5, '')::uuid, resolved_at = $6
 		WHERE c.workspace_id = $1::uuid AND c.profile_id = $2::uuid AND c.id = $3::uuid
 		RETURNING `+profileConflictColumns+`
 	`, workspaceID, profileID, conflictID, resolution, actorID, now))
 	if err != nil {
 		return profilesyncservice.Conflict{}, err
 	}
+	// Legacy data may hold several open conflicts; the profile stays blocked
+	// until every one of them is resolved.
 	if _, err := tx.Exec(ctx, `
-		UPDATE browser_profiles
-		SET status = $3, updated_at = $4, version = version + 1
-		WHERE workspace_id = $1::uuid AND id = $2::uuid
-	`, workspaceID, profileID, profileStatus, now); err != nil {
+		UPDATE browser_profiles AS p
+		SET status = CASE WHEN EXISTS (
+		        SELECT 1 FROM profile_conflicts c
+		        WHERE c.workspace_id = p.workspace_id AND c.profile_id = p.id AND c.status = 'open'
+		    ) THEN 'conflict' ELSE 'active' END,
+		    updated_at = $3, version = p.version + 1
+		WHERE p.workspace_id = $1::uuid AND p.id = $2::uuid
+	`, workspaceID, profileID, now); err != nil {
+		return profilesyncservice.Conflict{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO audit_events (
+			workspace_id, actor_user_id, action, resource_type, resource_id, outcome, metadata, created_at
+		) VALUES (
+			$1::uuid, NULLIF($2, '')::uuid, 'profile.conflict.resolve', 'browser_profile', $3::uuid, 'success',
+			jsonb_build_object('conflictId', $4::text, 'resolution', $5::text,
+			                   'localRevisionId', $6::text, 'remoteRevisionId', $7::text), $8
+		)
+	`, workspaceID, actorID, profileID, conflict.ID, resolution,
+		conflict.LocalRevisionID, conflict.RemoteRevisionID, now); err != nil {
 		return profilesyncservice.Conflict{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return profilesyncservice.Conflict{}, err
 	}
 	return conflict, nil
+}
+
+func (s *Store) LoadProfileConflictPlan(ctx context.Context, workspaceID, profileID, conflictID string) (profilesyncservice.Conflict, profilesyncservice.RevisionPlan, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return profilesyncservice.Conflict{}, profilesyncservice.RevisionPlan{}, err
+	}
+	defer rollback(ctx, tx)
+	if _, err := scanCloudProfile(tx.QueryRow(ctx, `
+		SELECT `+cloudProfileColumns+` FROM browser_profiles p
+		WHERE p.workspace_id = $1::uuid AND p.id = $2::uuid AND p.deleted_at IS NULL
+	`, workspaceID, profileID)); err != nil {
+		return profilesyncservice.Conflict{}, profilesyncservice.RevisionPlan{}, err
+	}
+	conflict, err := scanProfileConflict(tx.QueryRow(ctx, `
+		SELECT `+profileConflictColumns+` FROM profile_conflicts c
+		WHERE c.workspace_id = $1::uuid AND c.profile_id = $2::uuid AND c.id = $3::uuid
+	`, workspaceID, profileID, conflictID))
+	if err != nil {
+		return profilesyncservice.Conflict{}, profilesyncservice.RevisionPlan{}, err
+	}
+	revision, err := scanProfileRevision(tx.QueryRow(ctx, `
+		SELECT `+profileRevisionColumns+` FROM profile_revisions r
+		WHERE r.workspace_id = $1::uuid AND r.profile_id = $2::uuid AND r.id = $3::uuid
+	`, workspaceID, profileID, conflict.LocalRevisionID))
+	if err != nil {
+		return profilesyncservice.Conflict{}, profilesyncservice.RevisionPlan{}, err
+	}
+	manifest, err := scanProfileManifest(tx.QueryRow(ctx, `
+		SELECT manifest_json FROM profile_manifests WHERE revision_id = $1::uuid
+	`, revision.ID))
+	if err != nil {
+		return profilesyncservice.Conflict{}, profilesyncservice.RevisionPlan{}, err
+	}
+	objects, err := listProfileObjects(ctx, tx, workspaceID, revision.ID)
+	if err != nil {
+		return profilesyncservice.Conflict{}, profilesyncservice.RevisionPlan{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return profilesyncservice.Conflict{}, profilesyncservice.RevisionPlan{}, err
+	}
+	return conflict, profilesyncservice.RevisionPlan{Revision: revision, Manifest: manifest, Objects: objects}, nil
+}
+
+// insertProfileObjects writes a revision's object rows in one statement.
+// COPY is not usable here: PostgreSQL rejects COPY FROM on tables with row
+// level security for non-bypass roles, and profile_objects is FORCE RLS, so
+// the runtime role must go through INSERT and its WITH CHECK policy.
+func insertProfileObjects(ctx context.Context, tx pgx.Tx, objects []profilesyncservice.Object) error {
+	if len(objects) == 0 {
+		return nil
+	}
+	var (
+		ids, workspaces, revisions, keys, backends, keyRefs, contentTypes = make([]string, 0, len(objects)), make([]string, 0, len(objects)), make([]string, 0, len(objects)), make([]string, 0, len(objects)), make([]string, 0, len(objects)), make([]string, 0, len(objects)), make([]string, 0, len(objects))
+		hashes                                                            = make([][]byte, 0, len(objects))
+		sizes                                                             = make([]int64, 0, len(objects))
+		encrypted                                                         = make([]bool, 0, len(objects))
+		created                                                           = make([]time.Time, 0, len(objects))
+	)
+	for _, object := range objects {
+		decodedHash, err := hex.DecodeString(object.ContentHash)
+		if err != nil {
+			return err
+		}
+		ids = append(ids, object.ID)
+		workspaces = append(workspaces, object.WorkspaceID)
+		revisions = append(revisions, object.RevisionID)
+		keys = append(keys, object.ObjectKey)
+		hashes = append(hashes, decodedHash)
+		sizes = append(sizes, object.SizeBytes)
+		backends = append(backends, object.StorageBackend)
+		encrypted = append(encrypted, object.Encrypted)
+		keyRefs = append(keyRefs, object.EncryptionKeyRef)
+		contentTypes = append(contentTypes, object.ContentType)
+		created = append(created, object.CreatedAt)
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO profile_objects (
+			id, workspace_id, revision_id, object_key, content_hash, size_bytes,
+			storage_backend, encrypted, encryption_key_ref, content_type, created_at
+		)
+		SELECT o.id::uuid, o.workspace_id::uuid, o.revision_id::uuid, o.object_key, o.content_hash,
+		       o.size_bytes, o.storage_backend, o.encrypted, o.encryption_key_ref, o.content_type, o.created_at
+		FROM unnest(
+			$1::text[], $2::text[], $3::text[], $4::text[], $5::bytea[], $6::bigint[],
+			$7::text[], $8::boolean[], $9::text[], $10::text[], $11::timestamptz[]
+		) AS o(id, workspace_id, revision_id, object_key, content_hash, size_bytes,
+		       storage_backend, encrypted, encryption_key_ref, content_type, created_at)
+	`, ids, workspaces, revisions, keys, hashes, sizes, backends, encrypted, keyRefs, contentTypes, created)
+	return err
+}
+
+// openProfileConflict reports whether the profile has any open conflict.
+func openProfileConflict(ctx context.Context, tx pgx.Tx, workspaceID, profileID string) (bool, error) {
+	var open bool
+	err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM profile_conflicts
+			WHERE workspace_id = $1::uuid AND profile_id = $2::uuid AND status = 'open'
+		)
+	`, workspaceID, profileID).Scan(&open)
+	return open, err
 }
 
 func requireProfileLease(ctx context.Context, tx pgx.Tx, workspaceID, profileID, deviceID, hash string, now time.Time) error {

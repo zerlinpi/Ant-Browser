@@ -21,8 +21,8 @@ func (s *Store) CreateProxy(ctx context.Context, proxy proxyservice.Proxy) error
 		proxy.ID, proxy.WorkspaceID, proxy.Name, proxy.Protocol, proxy.Host, proxy.Port, proxy.Username,
 		proxy.HasCredentials, proxy.SecretRef, proxy.ConnectorType, proxy.Kernel, proxy.Status, proxy.Version,
 		proxy.CreatedBy, proxy.CreatedAt, proxy.UpdatedAt, proxy.DeletedAt)
-	if isUniqueViolation(err) {
-		return errors.New("proxy name already exists")
+	if isUniqueViolationOn(err, proxyNameIndex) {
+		return proxyservice.ErrNameConflict
 	}
 	return err
 }
@@ -59,8 +59,8 @@ func (s *Store) UpdateProxy(ctx context.Context, proxy proxyservice.Proxy, expec
 			return proxyservice.Proxy{}, proxyservice.ErrVersionConflict
 		}
 	}
-	if isUniqueViolation(err) {
-		return proxyservice.Proxy{}, errors.New("proxy name already exists")
+	if isUniqueViolationOn(err, proxyNameIndex) {
+		return proxyservice.Proxy{}, proxyservice.ErrNameConflict
 	}
 	return item, err
 }
@@ -119,13 +119,41 @@ func (s *Store) CreateProxyAssignment(ctx context.Context, assignment proxyservi
 	return item, err
 }
 
+// assignmentReadColumns resolve the proxy name through the tenant-scoped
+// (workspace_id, proxy_id) reference; the LEFT JOIN keeps an assignment
+// visible even if its proxy row were unreadable.
+const assignmentReadColumns = `a.id::text,a.workspace_id::text,a.proxy_id::text,
+	COALESCE(a.profile_id,a.account_id,a.browser_instance_id)::text,a.target_type,a.version,
+	COALESCE(a.created_by::text,''),a.created_at,a.updated_at,a.deleted_at,COALESCE(p.name,'')`
+
+const assignmentReadFrom = ` FROM proxy_assignments a
+	LEFT JOIN proxies p ON p.workspace_id=a.workspace_id AND p.id=a.proxy_id`
+
 func (s *Store) FindProxyAssignment(ctx context.Context, workspaceID, targetID, targetType string) (proxyservice.Assignment, error) {
-	return scanAssignment(s.pool.QueryRow(ctx, `SELECT id::text,workspace_id::text,proxy_id::text,
-		COALESCE(profile_id,account_id,browser_instance_id)::text,target_type,version,
-		COALESCE(created_by::text,''),created_at,updated_at,deleted_at
-		FROM proxy_assignments
-		WHERE workspace_id=$1::uuid AND COALESCE(profile_id,account_id,browser_instance_id)=$2::uuid
-		AND target_type=$3 AND deleted_at IS NULL`, workspaceID, targetID, targetType))
+	return scanNamedAssignment(s.pool.QueryRow(ctx, `SELECT `+assignmentReadColumns+assignmentReadFrom+`
+		WHERE a.workspace_id=$1::uuid AND COALESCE(a.profile_id,a.account_id,a.browser_instance_id)=$2::uuid
+		AND a.target_type=$3 AND a.deleted_at IS NULL`, workspaceID, targetID, targetType))
+}
+
+func (s *Store) ListProxyAssignments(ctx context.Context, workspaceID string, filter proxyservice.AssignmentFilter) ([]proxyservice.Assignment, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+assignmentReadColumns+assignmentReadFrom+`
+		WHERE a.workspace_id=$1::uuid AND a.deleted_at IS NULL
+		AND ($2='' OR a.proxy_id=NULLIF($2,'')::uuid)
+		AND ($3='' OR a.target_type=$3)
+		ORDER BY a.created_at,a.id`, workspaceID, filter.ProxyID, filter.TargetType)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]proxyservice.Assignment, 0)
+	for rows.Next() {
+		item, scanErr := scanNamedAssignment(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
 }
 
 func (s *Store) DeleteProxyAssignment(ctx context.Context, workspaceID, targetID, targetType string, expectedVersion int64, now time.Time) error {
@@ -259,6 +287,17 @@ func scanProxy(row scanner) (proxyservice.Proxy, error) {
 func scanAssignment(row scanner) (proxyservice.Assignment, error) {
 	var a proxyservice.Assignment
 	if err := row.Scan(&a.ID, &a.WorkspaceID, &a.ProxyID, &a.TargetID, &a.TargetType, &a.Version, &a.CreatedBy, &a.CreatedAt, &a.UpdatedAt, &a.DeletedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return proxyservice.Assignment{}, proxyservice.ErrNotFound
+		}
+		return proxyservice.Assignment{}, err
+	}
+	return a, nil
+}
+
+func scanNamedAssignment(row scanner) (proxyservice.Assignment, error) {
+	var a proxyservice.Assignment
+	if err := row.Scan(&a.ID, &a.WorkspaceID, &a.ProxyID, &a.TargetID, &a.TargetType, &a.Version, &a.CreatedBy, &a.CreatedAt, &a.UpdatedAt, &a.DeletedAt, &a.ProxyName); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return proxyservice.Assignment{}, proxyservice.ErrNotFound
 		}

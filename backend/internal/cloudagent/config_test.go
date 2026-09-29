@@ -12,13 +12,15 @@ func TestConfigRequiresExplicitDistinctBindingsAndNoCredentials(t *testing.T) {
 		body  string
 		valid bool
 	}{
-		{`{"baseUrl":"https://cloud.example.test",` + identity + `"bindings":{"AAAAAAAA-1111-4111-8111-111111111111":" local-one "}}`, true},
+		{`{"baseUrl":"https://cloud.example.test",` + identity + `"bindings":{"AAAAAAAA-1111-4111-8111-111111111111":" local-one "},"cloudProfiles":{"AAAAAAAA-1111-4111-8111-111111111111":"CCCCCCCC-CCCC-4CCC-8CCC-CCCCCCCCCCCC"}}`, true},
 		{`{` + identity + `"bindings":{}}`, false},
 		{`{` + identity + `"bindings":{"invalid":"local"}}`, false},
 		{`{` + identity + `"bindings":{"11111111-1111-4111-8111-111111111111":"local","22222222-2222-4222-8222-222222222222":"local"}}`, false},
 		{`{` + identity + `"credential":"secret","bindings":{"11111111-1111-4111-8111-111111111111":"local"}}`, false},
 		{`{` + identity + `"bindings":{"11111111-1111-4111-8111-111111111111":"local"}} {}`, false},
 		{`{"deviceId":"invalid","workspaceId":"BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB","bindings":{"11111111-1111-4111-8111-111111111111":"local"}}`, false},
+		{`{` + identity + `"bindings":{"11111111-1111-4111-8111-111111111111":"local"},"cloudProfiles":{"22222222-2222-4222-8222-222222222222":"cccccccc-cccc-4ccc-8ccc-cccccccccccc"}}`, false},
+		{`{` + identity + `"bindings":{"11111111-1111-4111-8111-111111111111":"local"},"cloudProfiles":{"11111111-1111-4111-8111-111111111111":"invalid"}}`, false},
 	}
 	for _, test := range cases {
 		path := filepath.Join(t.TempDir(), "agent.json")
@@ -30,7 +32,7 @@ func TestConfigRequiresExplicitDistinctBindingsAndNoCredentials(t *testing.T) {
 			t.Fatalf("config valid=%v err=%v", test.valid, err)
 		}
 		if test.valid {
-			if config.DeviceID != "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" || config.WorkspaceID != "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" || config.Bindings["aaaaaaaa-1111-4111-8111-111111111111"] != "local-one" {
+			if config.DeviceID != "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" || config.WorkspaceID != "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" || config.Bindings["aaaaaaaa-1111-4111-8111-111111111111"] != "local-one" || config.CloudProfiles["aaaaaaaa-1111-4111-8111-111111111111"] != "cccccccc-cccc-4ccc-8ccc-cccccccccccc" {
 				t.Fatalf("identities were not canonicalized: %#v", config)
 			}
 		}

@@ -19,6 +19,7 @@ var (
 	ErrForbidden         = errors.New("workspace permission denied")
 	ErrMemberExists      = errors.New("workspace member already exists")
 	ErrLastOwner         = errors.New("workspace must retain at least one owner")
+	ErrInvalidRole       = errors.New("invalid member role")
 	ErrVersionConflict   = errors.New("workspace version conflict")
 	ErrInvalidWorkspace  = errors.New("invalid workspace")
 	ErrInvitationInvalid = errors.New("invitation is invalid")
@@ -47,6 +48,10 @@ type Workspace struct {
 	CreatedAt      time.Time  `json:"createdAt"`
 	UpdatedAt      time.Time  `json:"updatedAt"`
 	DeletedAt      *time.Time `json:"deletedAt,omitempty"`
+	// Role is the calling user's role in this workspace. It is a per-caller
+	// projection, never persisted, and only set by operations that resolved
+	// the caller's active membership (list, get, create, update).
+	Role memberservice.Role `json:"role,omitempty"`
 }
 
 type Membership struct {
@@ -57,6 +62,18 @@ type Membership struct {
 	Status      string             `json:"status"`
 	JoinedAt    time.Time          `json:"joinedAt"`
 	UpdatedAt   time.Time          `json:"updatedAt"`
+	// Email and DisplayName are read-only projections of the member's user
+	// record, populated by member listings and role changes.
+	Email       string `json:"email,omitempty"`
+	DisplayName string `json:"displayName,omitempty"`
+}
+
+// MemberRemoval reports what removing a member changed. The member's devices
+// in the workspace are revoked in the same transaction; callers use the IDs to
+// terminate live agent connections that were authenticated before removal.
+type MemberRemoval struct {
+	Membership       Membership `json:"membership"`
+	RevokedDeviceIDs []string   `json:"revokedDeviceIds"`
 }
 
 type Invitation struct {
@@ -88,8 +105,13 @@ type Repository interface {
 	FindOrganizationMembership(context.Context, string, string) (OrganizationMembership, error)
 	ListMembers(context.Context, string) ([]Membership, error)
 	AddMember(context.Context, Membership) error
+	// UpdateMemberRole changes an active member's role. Demoting the last
+	// active owner fails with ErrLastOwner.
 	UpdateMemberRole(context.Context, string, string, memberservice.Role) (Membership, error)
-	RemoveMember(context.Context, string, string) error
+	// RemoveMember marks an active membership removed and, atomically with
+	// it, revokes the member's devices and device credentials in that
+	// workspace. Removing the last active owner fails with ErrLastOwner.
+	RemoveMember(context.Context, string, string, time.Time) (MemberRemoval, error)
 	CreateInvitation(context.Context, Invitation, string) error
 	ListInvitations(context.Context, string) ([]Invitation, error)
 	RevokeInvitation(context.Context, string, string, time.Time) error
@@ -144,25 +166,28 @@ func (s *Service) Create(ctx context.Context, ownerID string, input CreateInput)
 	if err := s.repository.CreateOrganizationWorkspace(ctx, organization, workspace, membership); err != nil {
 		return Workspace{}, err
 	}
+	// The creator is the sole owner; Role is a response projection only.
+	workspace.Role = memberservice.RoleOwner
 	return workspace, nil
 }
 
+// List returns the caller's active workspaces with Role set to the caller's
+// role in each one.
 func (s *Service) List(ctx context.Context, userID string) ([]Workspace, error) {
 	return s.repository.ListWorkspaces(ctx, userID)
 }
 
 func (s *Service) Get(ctx context.Context, userID, workspaceID string) (Workspace, error) {
-	if err := s.Require(ctx, workspaceID, userID, memberservice.PermissionWorkspaceRead); err != nil {
+	workspace, membership, err := s.authorize(ctx, workspaceID, userID, memberservice.PermissionWorkspaceRead)
+	if err != nil {
 		return Workspace{}, err
 	}
-	return s.repository.FindWorkspace(ctx, workspaceID)
+	workspace.Role = membership.Role
+	return workspace, nil
 }
 
 func (s *Service) Update(ctx context.Context, userID, workspaceID, name string, expectedVersion int64) (Workspace, error) {
-	if err := s.Require(ctx, workspaceID, userID, memberservice.PermissionWorkspaceUpdate); err != nil {
-		return Workspace{}, err
-	}
-	workspace, err := s.repository.FindWorkspace(ctx, workspaceID)
+	workspace, membership, err := s.authorize(ctx, workspaceID, userID, memberservice.PermissionWorkspaceUpdate)
 	if err != nil {
 		return Workspace{}, err
 	}
@@ -176,19 +201,37 @@ func (s *Service) Update(ctx context.Context, userID, workspaceID, name string, 
 		workspace.Slug = "ws-" + strings.ReplaceAll(workspace.ID[:8], "-", "")
 	}
 	workspace.UpdatedAt = s.now().UTC()
-	return s.repository.UpdateWorkspace(ctx, workspace, expectedVersion)
+	updated, err := s.repository.UpdateWorkspace(ctx, workspace, expectedVersion)
+	if err != nil {
+		return Workspace{}, err
+	}
+	updated.Role = membership.Role
+	return updated, nil
 }
 
 func (s *Service) Require(ctx context.Context, workspaceID, userID string, permission memberservice.Permission) error {
+	_, _, err := s.authorize(ctx, workspaceID, userID, permission)
+	return err
+}
+
+// authorize is Require returning the active workspace and the caller's
+// membership, so callers can use the caller's role without a second lookup.
+// A device grant authorizes without a membership; the returned Membership is
+// then empty and must not be treated as a role.
+func (s *Service) authorize(ctx context.Context, workspaceID, userID string, permission memberservice.Permission) (Workspace, Membership, error) {
 	workspace, workspaceErr := s.repository.FindWorkspace(ctx, workspaceID)
 	if workspaceErr != nil || workspace.Status != "active" {
-		return ErrForbidden
+		return Workspace{}, Membership{}, ErrForbidden
+	}
+	workspace.Role = ""
+	if memberservice.DeviceAuthorized(ctx, workspaceID, permission) {
+		return workspace, Membership{}, nil
 	}
 	membership, err := s.repository.FindMembership(ctx, workspaceID, userID)
 	if err != nil || membership.Status != "active" || !memberservice.HasPermission(membership.Role, permission) {
-		return ErrForbidden
+		return Workspace{}, Membership{}, ErrForbidden
 	}
-	return nil
+	return workspace, membership, nil
 }
 
 // RequireOrganization authorizes organization-scoped surfaces such as
@@ -210,12 +253,15 @@ func (s *Service) Members(ctx context.Context, actorID, workspaceID string) ([]M
 	return s.repository.ListMembers(ctx, workspaceID)
 }
 
+// AddMember adds (or re-activates a previously removed) member with a
+// non-owner role.
 func (s *Service) AddMember(ctx context.Context, actorID, workspaceID, userID string, role memberservice.Role) (Membership, error) {
 	if err := s.Require(ctx, workspaceID, actorID, memberservice.PermissionMemberInvite); err != nil {
 		return Membership{}, err
 	}
-	if _, ok := memberservice.ParseRole(string(role)); !ok || role == memberservice.RoleOwner {
-		return Membership{}, errors.New("invalid member role")
+	role, ok := memberservice.ParseRole(string(role))
+	if !ok || role == memberservice.RoleOwner {
+		return Membership{}, ErrInvalidRole
 	}
 	now := s.now().UTC()
 	membership := Membership{
@@ -228,14 +274,60 @@ func (s *Service) AddMember(ctx context.Context, actorID, workspaceID, userID st
 	return membership, nil
 }
 
+// ChangeRole sets an active member's role. The actor needs member.manage;
+// ownership cannot be granted this way, and only an owner may change another
+// owner's role. Demoting the last owner fails with ErrLastOwner.
 func (s *Service) ChangeRole(ctx context.Context, actorID, workspaceID, userID string, role memberservice.Role) (Membership, error) {
-	if err := s.Require(ctx, workspaceID, actorID, memberservice.PermissionMemberManage); err != nil {
+	_, actor, err := s.authorize(ctx, workspaceID, actorID, memberservice.PermissionMemberManage)
+	if err != nil {
 		return Membership{}, err
 	}
-	if _, ok := memberservice.ParseRole(string(role)); !ok {
-		return Membership{}, errors.New("invalid member role")
+	role, ok := memberservice.ParseRole(string(role))
+	if !ok || role == memberservice.RoleOwner {
+		return Membership{}, ErrInvalidRole
 	}
-	return s.repository.UpdateMemberRole(ctx, workspaceID, userID, role)
+	target, err := s.manageableMember(ctx, actor, workspaceID, userID)
+	if err != nil {
+		return Membership{}, err
+	}
+	return s.repository.UpdateMemberRole(ctx, workspaceID, target.UserID, role)
+}
+
+// RemoveMember removes an active member and revokes that member's devices
+// (and their credentials) in the workspace. The same actor rules as
+// ChangeRole apply; removing the last owner fails with ErrLastOwner.
+func (s *Service) RemoveMember(ctx context.Context, actorID, workspaceID, userID string) (MemberRemoval, error) {
+	_, actor, err := s.authorize(ctx, workspaceID, actorID, memberservice.PermissionMemberManage)
+	if err != nil {
+		return MemberRemoval{}, err
+	}
+	target, err := s.manageableMember(ctx, actor, workspaceID, userID)
+	if err != nil {
+		return MemberRemoval{}, err
+	}
+	return s.repository.RemoveMember(ctx, workspaceID, target.UserID, s.now().UTC())
+}
+
+// manageableMember loads the target's active membership and applies the
+// owner rule: members whose current role is owner can only be modified or
+// removed by an owner. Missing and inactive memberships are not found.
+func (s *Service) manageableMember(ctx context.Context, actor Membership, workspaceID, userID string) (Membership, error) {
+	userID = strings.TrimSpace(userID)
+	if _, err := uuid.Parse(userID); err != nil || len(userID) != 36 {
+		// User IDs are UUIDs; reject other forms before PostgreSQL does.
+		return Membership{}, ErrNotFound
+	}
+	target, err := s.repository.FindMembership(ctx, workspaceID, userID)
+	if errors.Is(err, ErrNotFound) || (err == nil && target.Status != "active") {
+		return Membership{}, ErrNotFound
+	}
+	if err != nil {
+		return Membership{}, err
+	}
+	if target.Role == memberservice.RoleOwner && actor.Role != memberservice.RoleOwner {
+		return Membership{}, ErrForbidden
+	}
+	return target, nil
 }
 
 type InviteInput struct {

@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 
@@ -67,12 +68,15 @@ func (s *Store) CreateOrganizationWorkspace(ctx context.Context, organization wo
 	return tx.Commit(ctx)
 }
 
+// ListWorkspaces returns the user's active workspaces. Role is the user's own
+// membership role, read from the same membership row that grants visibility.
 func (s *Store) ListWorkspaces(ctx context.Context, userID string) ([]workspaceservice.Workspace, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT `+workspaceColumns+`
+		SELECT `+workspaceColumns+`, r.code
 		FROM workspaces w
 		JOIN organizations o ON o.id = w.organization_id
 		JOIN workspace_members wm ON wm.workspace_id = w.id
+		JOIN roles r ON r.id = wm.role_id
 		WHERE wm.user_id = $1::uuid AND wm.status = 'active'
 		  AND w.status = 'active' AND o.status = 'active' AND w.deleted_at IS NULL
 		ORDER BY w.created_at, w.id
@@ -83,10 +87,16 @@ func (s *Store) ListWorkspaces(ctx context.Context, userID string) ([]workspaces
 	defer rows.Close()
 	items := make([]workspaceservice.Workspace, 0)
 	for rows.Next() {
-		workspace, scanErr := scanWorkspace(rows)
-		if scanErr != nil {
+		var workspace workspaceservice.Workspace
+		var role string
+		if scanErr := rows.Scan(
+			&workspace.ID, &workspace.OrganizationID, &workspace.Name, &workspace.Slug,
+			&workspace.Status, &workspace.Version, &workspace.CreatedAt, &workspace.UpdatedAt, &workspace.DeletedAt,
+			&role,
+		); scanErr != nil {
 			return nil, scanErr
 		}
+		workspace.Role = memberservice.Role(role)
 		items = append(items, workspace)
 	}
 	return items, rows.Err()
@@ -189,12 +199,18 @@ func (s *Store) FindOrganizationMembership(ctx context.Context, organizationID, 
 	return membership, nil
 }
 
+// memberProfileColumns extends the membership projection with the member's
+// user profile; queries using it must join users as u.
+const memberProfileColumns = `
+	wm.id::text, wm.workspace_id::text, wm.user_id::text, r.code,
+	wm.status, wm.joined_at, wm.updated_at, u.email, u.display_name`
+
 func (s *Store) ListMembers(ctx context.Context, workspaceID string) ([]workspaceservice.Membership, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT wm.id::text, wm.workspace_id::text, wm.user_id::text, r.code,
-		       wm.status, wm.joined_at, wm.updated_at
+		SELECT `+memberProfileColumns+`
 		FROM workspace_members wm
 		JOIN roles r ON r.id = wm.role_id
+		JOIN users u ON u.id = wm.user_id
 		WHERE wm.workspace_id = $1::uuid AND wm.status = 'active'
 		ORDER BY wm.joined_at, wm.user_id
 	`, workspaceID)
@@ -204,13 +220,30 @@ func (s *Store) ListMembers(ctx context.Context, workspaceID string) ([]workspac
 	defer rows.Close()
 	items := make([]workspaceservice.Membership, 0)
 	for rows.Next() {
-		membership, scanErr := scanMembership(rows)
+		membership, scanErr := scanMemberProfile(rows)
 		if scanErr != nil {
 			return nil, scanErr
 		}
 		items = append(items, membership)
 	}
 	return items, rows.Err()
+}
+
+func scanMemberProfile(row scanner) (workspaceservice.Membership, error) {
+	var membership workspaceservice.Membership
+	var role string
+	if err := row.Scan(
+		&membership.ID, &membership.WorkspaceID, &membership.UserID, &role,
+		&membership.Status, &membership.JoinedAt, &membership.UpdatedAt,
+		&membership.Email, &membership.DisplayName,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return workspaceservice.Membership{}, workspaceservice.ErrNotFound
+		}
+		return workspaceservice.Membership{}, err
+	}
+	membership.Role = memberservice.Role(role)
+	return membership, nil
 }
 
 func scanMembership(row scanner) (workspaceservice.Membership, error) {
@@ -229,13 +262,22 @@ func scanMembership(row scanner) (workspaceservice.Membership, error) {
 	return membership, nil
 }
 
+// AddMember inserts a membership. A previously removed membership of the same
+// user is re-activated in place (the row is kept because notifications and
+// preferences reference it); an active or invited one is a conflict. The
+// team-seat trigger fires for both the insert and the re-activation.
 func (s *Store) AddMember(ctx context.Context, membership workspaceservice.Membership) error {
-	_, err := s.pool.Exec(ctx, `
+	tag, err := s.pool.Exec(ctx, `
 		INSERT INTO workspace_members (
 			id, workspace_id, user_id, role_id, status, joined_at, created_at, updated_at
+		) VALUES (
+			$1::uuid, $2::uuid, $3::uuid, (SELECT r.id FROM roles r WHERE r.code = $7),
+			$4, $5, $5, $6
 		)
-		SELECT $1::uuid, $2::uuid, $3::uuid, id, $4, $5, $5, $6
-		FROM roles WHERE code = $7
+		ON CONFLICT (workspace_id, user_id) DO UPDATE
+		SET id = EXCLUDED.id, role_id = EXCLUDED.role_id, status = EXCLUDED.status,
+		    joined_at = EXCLUDED.joined_at, updated_at = EXCLUDED.updated_at
+		WHERE workspace_members.status = 'removed'
 	`, membership.ID, membership.WorkspaceID, membership.UserID, membership.Status, membership.JoinedAt, membership.UpdatedAt, string(membership.Role))
 	if isUniqueViolation(err) {
 		return workspaceservice.ErrMemberExists
@@ -246,9 +288,19 @@ func (s *Store) AddMember(ctx context.Context, membership workspaceservice.Membe
 	if isBillingQuotaViolation(err) {
 		return billingservice.ErrQuotaExceeded
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		// The conflicting membership is not removed, so the upsert was a no-op.
+		return workspaceservice.ErrMemberExists
+	}
+	return nil
 }
 
+// UpdateMemberRole changes the role of an active membership. Demoting the
+// last active owner fails with ErrLastOwner; SERIALIZABLE isolation keeps two
+// concurrent owner demotions from both passing the owner count.
 func (s *Store) UpdateMemberRole(ctx context.Context, workspaceID, userID string, role memberservice.Role) (workspaceservice.Membership, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
@@ -260,33 +312,25 @@ func (s *Store) UpdateMemberRole(ctx context.Context, workspaceID, userID string
 		       wm.status, wm.joined_at, wm.updated_at
 		FROM workspace_members wm
 		JOIN roles r ON r.id = wm.role_id
-		WHERE wm.workspace_id = $1::uuid AND wm.user_id = $2::uuid
+		WHERE wm.workspace_id = $1::uuid AND wm.user_id = $2::uuid AND wm.status = 'active'
 		FOR UPDATE OF wm
 	`, workspaceID, userID))
 	if err != nil {
 		return workspaceservice.Membership{}, err
 	}
 	if current.Role == memberservice.RoleOwner && role != memberservice.RoleOwner {
-		var ownerCount int
-		if err := tx.QueryRow(ctx, `
-			SELECT count(*)
-			FROM workspace_members wm JOIN roles r ON r.id = wm.role_id
-			WHERE wm.workspace_id = $1::uuid AND wm.status = 'active' AND r.code = 'owner'
-		`, workspaceID).Scan(&ownerCount); err != nil {
+		if err := requireAnotherOwner(ctx, tx, workspaceID); err != nil {
 			return workspaceservice.Membership{}, err
-		}
-		if ownerCount <= 1 {
-			return workspaceservice.Membership{}, workspaceservice.ErrLastOwner
 		}
 	}
 	now := time.Now().UTC()
-	updated, err := scanMembership(tx.QueryRow(ctx, `
+	updated, err := scanMemberProfile(tx.QueryRow(ctx, `
 		UPDATE workspace_members wm
 		SET role_id = r.id, updated_at = $4
-		FROM roles r
-		WHERE wm.workspace_id = $1::uuid AND wm.user_id = $2::uuid AND r.code = $3
-		RETURNING wm.id::text, wm.workspace_id::text, wm.user_id::text, r.code,
-		          wm.status, wm.joined_at, wm.updated_at
+		FROM roles r, users u
+		WHERE wm.workspace_id = $1::uuid AND wm.user_id = $2::uuid AND wm.status = 'active'
+		  AND r.code = $3 AND u.id = wm.user_id
+		RETURNING `+memberProfileColumns+`
 	`, workspaceID, userID, string(role), now))
 	if err != nil {
 		return workspaceservice.Membership{}, err
@@ -297,10 +341,17 @@ func (s *Store) UpdateMemberRole(ctx context.Context, workspaceID, userID string
 	return updated, nil
 }
 
-func (s *Store) RemoveMember(ctx context.Context, workspaceID, userID string) error {
+// RemoveMember marks an active membership removed and, in the same
+// transaction, revokes the member's devices and all of their credentials in
+// the workspace, so the member's agents stop authenticating at commit.
+func (s *Store) RemoveMember(ctx context.Context, workspaceID, userID string, now time.Time) (workspaceservice.MemberRemoval, error) {
+	// Device rows are protected by RLS. Bind the workspace scope explicitly so
+	// revocation can never silently match zero rows because a caller omitted
+	// the request tenant scope; a conflicting scope fails the transaction.
+	ctx = WithTenantScope(ctx, TenantScope{WorkspaceID: workspaceID})
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
-		return err
+		return workspaceservice.MemberRemoval{}, err
 	}
 	defer rollback(ctx, tx)
 	current, err := scanMembership(tx.QueryRow(ctx, `
@@ -308,35 +359,83 @@ func (s *Store) RemoveMember(ctx context.Context, workspaceID, userID string) er
 		       wm.status, wm.joined_at, wm.updated_at
 		FROM workspace_members wm
 		JOIN roles r ON r.id = wm.role_id
-		WHERE wm.workspace_id = $1::uuid AND wm.user_id = $2::uuid
+		WHERE wm.workspace_id = $1::uuid AND wm.user_id = $2::uuid AND wm.status = 'active'
 		FOR UPDATE OF wm
 	`, workspaceID, userID))
 	if err != nil {
-		return err
+		return workspaceservice.MemberRemoval{}, err
 	}
 	if current.Role == memberservice.RoleOwner {
-		var ownerCount int
-		if err := tx.QueryRow(ctx, `
-			SELECT count(*) FROM workspace_members wm JOIN roles r ON r.id = wm.role_id
-			WHERE wm.workspace_id = $1::uuid AND wm.status = 'active' AND r.code = 'owner'
-		`, workspaceID).Scan(&ownerCount); err != nil {
-			return err
-		}
-		if ownerCount <= 1 {
-			return workspaceservice.ErrLastOwner
+		if err := requireAnotherOwner(ctx, tx, workspaceID); err != nil {
+			return workspaceservice.MemberRemoval{}, err
 		}
 	}
-	tag, err := tx.Exec(ctx, `
-		UPDATE workspace_members SET status = 'removed', updated_at = now()
-		WHERE workspace_id = $1::uuid AND user_id = $2::uuid AND status <> 'removed'
-	`, workspaceID, userID)
+	removed, err := scanMembership(tx.QueryRow(ctx, `
+		UPDATE workspace_members wm
+		SET status = 'removed', updated_at = $3
+		FROM roles r
+		WHERE wm.workspace_id = $1::uuid AND wm.user_id = $2::uuid AND wm.status = 'active'
+		  AND r.id = wm.role_id
+		RETURNING wm.id::text, wm.workspace_id::text, wm.user_id::text, r.code,
+		          wm.status, wm.joined_at, wm.updated_at
+	`, workspaceID, userID, now))
 	if err != nil {
+		return workspaceservice.MemberRemoval{}, err
+	}
+	rows, err := tx.Query(ctx, `
+		UPDATE devices
+		SET status = 'revoked', revoked_at = $3, updated_at = $3
+		WHERE workspace_id = $1::uuid AND user_id = $2::uuid AND revoked_at IS NULL
+		RETURNING id::text
+	`, workspaceID, userID, now)
+	if err != nil {
+		return workspaceservice.MemberRemoval{}, err
+	}
+	revoked := make([]string, 0)
+	for rows.Next() {
+		var deviceID string
+		if err := rows.Scan(&deviceID); err != nil {
+			rows.Close()
+			return workspaceservice.MemberRemoval{}, err
+		}
+		revoked = append(revoked, deviceID)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return workspaceservice.MemberRemoval{}, err
+	}
+	// Also covers devices revoked earlier whose credentials were left active.
+	if _, err := tx.Exec(ctx, `
+		UPDATE device_credentials dc
+		SET revoked_at = $3
+		FROM devices d
+		WHERE dc.device_id = d.id AND d.workspace_id = $1::uuid AND d.user_id = $2::uuid
+		  AND dc.revoked_at IS NULL
+	`, workspaceID, userID, now); err != nil {
+		return workspaceservice.MemberRemoval{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return workspaceservice.MemberRemoval{}, err
+	}
+	sort.Strings(revoked)
+	return workspaceservice.MemberRemoval{Membership: removed, RevokedDeviceIDs: revoked}, nil
+}
+
+// requireAnotherOwner fails with ErrLastOwner unless the workspace has more
+// than one active owner.
+func requireAnotherOwner(ctx context.Context, tx pgx.Tx, workspaceID string) error {
+	var ownerCount int
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*)
+		FROM workspace_members wm JOIN roles r ON r.id = wm.role_id
+		WHERE wm.workspace_id = $1::uuid AND wm.status = 'active' AND r.code = 'owner'
+	`, workspaceID).Scan(&ownerCount); err != nil {
 		return err
 	}
-	if tag.RowsAffected() != 1 {
-		return workspaceservice.ErrNotFound
+	if ownerCount <= 1 {
+		return workspaceservice.ErrLastOwner
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 func (s *Store) CreateInvitation(ctx context.Context, invitation workspaceservice.Invitation, tokenHash string) error {
@@ -427,7 +526,14 @@ func (s *Store) AcceptInvitation(ctx context.Context, workspaceID, tokenHash str
 		if strings.ToLower(strings.TrimSpace(inviteEmail)) != strings.ToLower(strings.TrimSpace(email)) {
 			return workspaceservice.ErrInvitationInvalid
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO workspace_members(id,workspace_id,user_id,role_id,status,joined_at,created_at,updated_at) SELECT $1::uuid,$2::uuid,$3::uuid,r.id,'active',$4,$4,$4 FROM roles r WHERE r.code=$5`, membership.ID, workspaceID, membership.UserID, membership.JoinedAt, role)
+		// A removed membership is re-activated in place; an active one is a
+		// conflict and leaves the invitation pending.
+		tag, err := tx.Exec(ctx, `INSERT INTO workspace_members(id,workspace_id,user_id,role_id,status,joined_at,created_at,updated_at)
+			SELECT $1::uuid,$2::uuid,$3::uuid,r.id,'active',$4,$4,$4 FROM roles r WHERE r.code=$5
+			ON CONFLICT (workspace_id, user_id) DO UPDATE
+			SET id = EXCLUDED.id, role_id = EXCLUDED.role_id, status = EXCLUDED.status,
+			    joined_at = EXCLUDED.joined_at, updated_at = EXCLUDED.updated_at
+			WHERE workspace_members.status = 'removed'`, membership.ID, workspaceID, membership.UserID, membership.JoinedAt, role)
 		if err != nil {
 			if isUniqueViolation(err) {
 				return workspaceservice.ErrMemberExists
@@ -436,6 +542,9 @@ func (s *Store) AcceptInvitation(ctx context.Context, workspaceID, tokenHash str
 				return billingservice.ErrQuotaExceeded
 			}
 			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return workspaceservice.ErrMemberExists
 		}
 		_, err = tx.Exec(ctx, `UPDATE workspace_invitations SET status='accepted',accepted_at=$2 WHERE id=$1::uuid`, id, now)
 		if err == nil {

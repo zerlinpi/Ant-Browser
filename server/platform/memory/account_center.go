@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,8 +37,23 @@ func (s *Store) CreateAccount(_ context.Context, account accountservice.Account)
 	if _, exists := state.accounts[account.ID]; exists {
 		return accountservice.ErrVersionConflict
 	}
+	if state.identifierTakenLocked(account) {
+		return accountservice.ErrIdentifierConflict
+	}
 	state.accounts[account.ID] = cloneAccount(account)
 	return nil
+}
+
+// identifierTakenLocked mirrors accounts_live_identifier_uq: an identifier is
+// unique per workspace and platform among live accounts, ignoring case.
+func (state *accountCenterState) identifierTakenLocked(account accountservice.Account) bool {
+	for id, existing := range state.accounts {
+		if id != account.ID && existing.WorkspaceID == account.WorkspaceID && existing.DeletedAt == nil &&
+			existing.Platform == account.Platform && strings.EqualFold(existing.Identifier, account.Identifier) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) FindAccount(_ context.Context, workspaceID, accountID string) (accountservice.Account, error) {
@@ -74,6 +90,9 @@ func (s *Store) UpdateAccount(_ context.Context, account accountservice.Account,
 	}
 	if current.Version != expectedVersion {
 		return accountservice.Account{}, accountservice.ErrVersionConflict
+	}
+	if state.identifierTakenLocked(account) {
+		return accountservice.Account{}, accountservice.ErrIdentifierConflict
 	}
 	account.Version = current.Version + 1
 	account.CreatedAt = current.CreatedAt
