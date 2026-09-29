@@ -77,6 +77,8 @@ type Gateway struct {
 	allowedOrigins  []string
 	clientIPs       *httpx.ClientIPResolver
 	limits          *rateLimiters
+	// extensions holds feature dependencies registered in extensions.go.
+	extensions map[interface{}]interface{}
 }
 
 // AllowedOrigins configures exact browser origins for authenticated CORS and
@@ -147,6 +149,7 @@ func NewWithInfrastructure(
 		tokens: tokens, dependency: dependency, logger: logger, agentHub: newAgentHub(), notificationHub: newNotificationHub(),
 		realtime: realtimeBus, nodeID: uuid.NewString(), tasks: tasks, taskWake: taskWake,
 		fingerprints: fingerprints, profiles: profiles, workflows: workflows, accounts: accounts, proxies: proxies,
+		extensions: make(map[interface{}]interface{}),
 	}
 	var trustedProxies TrustedProxies
 	var rateLimits *RateLimits
@@ -170,6 +173,8 @@ func NewWithInfrastructure(
 			trustedProxies = append(TrustedProxies(nil), value...)
 		case RateLimits:
 			rateLimits = &value
+		default:
+			gateway.handleExtensionOption(option)
 		}
 	}
 	gateway.clientIPs = gateway.newClientIPResolver(trustedProxies)
@@ -378,7 +383,8 @@ func NewWithInfrastructure(
 		protected.HandleFunc("POST /api/v1/organizations/{organizationID}/billing/licenses/validate", gateway.validateLicense)
 		protected.HandleFunc("DELETE /api/v1/organizations/{organizationID}/billing/licenses/{activationID}", gateway.revokeLicense)
 	}
-	mux.Handle("/api/v1/", gateway.authenticate(protected))
+	gateway.registerExtensionRoutes(mux, protected)
+	mux.Handle("/api/v1/", gateway.authenticate(gateway.wrapProtected(protected)))
 
 	return httpx.RequestIDMiddleware(
 		httpx.SecurityHeaders(
@@ -864,6 +870,10 @@ func (g *Gateway) meterAPIRequest(ctx context.Context, r *http.Request, identity
 }
 
 func (g *Gateway) writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
+	if problem, ok := g.mapExtensionError(w, r, err); ok {
+		httpx.WriteError(w, r, problem)
+		return
+	}
 	problem := httpx.Problem{Status: http.StatusInternalServerError, Code: "internal_error", Message: "The request could not be completed"}
 	switch {
 	case errors.Is(err, batchservice.ErrBatchTooLarge):
