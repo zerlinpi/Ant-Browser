@@ -125,7 +125,7 @@ server/
 
 ### ADR-001：保留现有运行时，抽出 Agent
 
-现有 <code>backend/app_instance_*.go</code>、<code>backend/internal/browser</code>、<code>backend/internal/proxy</code>、<code>backend/internal/automation</code> 是真实资产。Phase 3 将其重构到 Agent/Runtime ports，而不是用 <code>browser-runtime/</code> 的 TODO 文件替换。
+现有 <code>backend/app_instance_*.go</code>、<code>backend/internal/browser</code>、<code>backend/internal/proxy</code>、<code>backend/internal/automation</code> 是真实资产。Phase 3 将其重构到 Agent/Runtime ports，而不是用新写的空壳运行时替换。
 
 目标接口：
 
@@ -146,7 +146,7 @@ Wails event、文件对话框和 UI toast 留在桌面适配层；运行时核�
 用户目标明确要求 Vue3。为避免框架重写阻塞 Cloud：
 
 1. 保留当前 <code>frontend/</code> React 客户端作为兼容基线。
-2. 在 <code>desktop-client/</code> 建立新的 Wails/Vue3/TypeScript 客户端。
+2. 建立新的 Wails/Vue3/TypeScript 客户端（已落地：桌面壳 <code>desktop/wails-client</code>，界面 <code>desktop/vue3-ui</code>）。
 3. 新客户端只通过 Agent application service 和 Cloud API 工作，不直接访问 SQLite 或 <code>exec.Cmd</code>。
 4. Browser Manager、Proxy Center、Automation 等达到功能等价且回归通过后再切换默认入口。
 5. React 客户端至少保留一个稳定发布周期作为回滚通道。
@@ -350,7 +350,7 @@ Cloud 至少一次投递；Agent 通过本地 operation journal 对 commandId/id
 | 交付项 | 本阶段结果 |
 | --- | --- |
 | 修改文件 | 无业务代码修改 |
-| 新增文件 | <code>CURRENT_ARCHITECTURE.md</code>、<code>UPGRADE_ROADMAP.md</code> |
+| 新增文件 | <code>UPGRADE_ROADMAP.md</code> 及升级前的架构审计快照（已随骨架目录清理删除，当前实现见 <code>docs/architecture.md</code>） |
 | 数据库变化 | 无 |
 | API 设计 | 记录当前本地 Launch/CDP；定义 Cloud REST/Agent WS 方向 |
 | 测试方案 | GitHub 目录树复核、关键文件证据检查、Markdown 结构和提交回读 |
@@ -368,7 +368,7 @@ Cloud 至少一次投递；Agent 通过本地 operation journal 对 commandId/id
 
 拟修改/新增：
 
-- 重建 <code>server/go.mod</code>、<code>server/cmd</code>、<code>server/services</code>、<code>server/platform</code> 和 <code>server/contracts</code>。
+- 重建 <code>server/go.mod</code>、<code>server/cmd</code>、<code>server/services</code>、<code>server/platform</code>，接口契约放在 <code>server/contracts</code>。
 - 保留有价值的 SQL 概念，但重新编号不可变 migrations；废弃重复 <code>workspace_members</code> 定义。
 - 新增 <code>deploy/compose/docker-compose.yml</code>、服务 Dockerfile、环境模板和迁移命令。
 - 新增根 CI：Go fmt/vet/test、server test、migration test、frontend build、依赖和 secret scan。
@@ -411,7 +411,7 @@ API：
 
 - 新增 <code>agent/</code>：application、runtime、cloudclient、journal、security、updater。
 - 从现有 backend 抽出 Browser/Proxy/CDP/Automation adapters；先保持行为一致。
-- 重建 <code>desktop-client/</code> 为 Wails + Vue3 + TypeScript。
+- 以 Wails + Vue3 + TypeScript 重建桌面客户端（已落地为 <code>desktop/wails-client</code> 与 <code>desktop/vue3-ui</code>）。
 - 页面：Login、Dashboard、Workspace、Browser Manager、Settings。
 - React 客户端保留兼容入口和功能回归套件。
 

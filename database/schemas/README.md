@@ -2,8 +2,7 @@
 
 The SQL files in `database/migrations/` are the authoritative cloud schema for
 the control-plane and worker. They are intentionally separate from the legacy
-desktop SQLite migrations in `backend/internal/database/sqlite.go` and from the
-Phase-0 drafts in `server/migrations/`.
+desktop SQLite migrations in `backend/internal/database/sqlite.go`.
 
 ## Ordering and policy
 

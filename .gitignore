@@ -57,12 +57,20 @@ chrome/*
 publish/staging/
 publish/output/
 
-# Internal docs / scratch files
+# Internal docs / scratch files. Published technical docs are listed explicitly.
 !docs/
 docs/*
+!docs/api.md
+!docs/architecture.md
+!docs/cloud-commands.md
 !docs/cloud-deployment.md
-!docs/security.md
+!docs/database.md
+!docs/notifications.md
+!docs/postgres-roles.md
 !docs/proxy-connector-stacks.md
+!docs/proxy-health-worker.md
+!docs/security.md
+!docs/workflow-runtime.md
 DEPLOYMENT_GUIDE.md
 plan.md
 pic/

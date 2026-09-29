@@ -26,6 +26,7 @@ Ant Browser 的目标很明确：在一台桌面设备上，帮助用户稳定�
 - [核心特性](#核心特性)
 - [界面预览](#界面预览)
 - [快速开始](#快速开始)
+- [源码启动指南（桌面端与 Cloud 云端版）](#源码启动指南)
 - [常用操作](#常用操作)
 - [常见问题](#常见问题)
 - [Roadmap](#roadmap)
@@ -194,16 +195,16 @@ Ant Browser 适合以下场景：
 
 1. 开发默认使用 `master` 分支；该分支不带测试用户数据，适合作为日常开发基线。
 2. 如需带测试库的演示环境，请切换到 `user_data` 分支。
-3. Windows 统一执行 `bat\dev.bat`；默认是 `live` 热更新模式，如需静态资源排查使用 `bat\dev.bat stable`，如需受限内存复现使用 `bat\dev.bat limited`。
+3. Windows 统一执行 `bat\dev.bat`；默认是 `stable` 静态资源模式，需要前端热更新时使用 `bat\dev.bat live`，需要受限内存复现时使用 `bat\dev.bat limited`。macOS / Linux 执行 `./dev.sh`（默认 `stable`）或 `./dev.sh live`。
 4. Windows 运行时使用 `bin/xray.exe`、`bin/sing-box.exe`；Linux 运行时使用 `bin/linux-<arch>/xray`、`bin/linux-<arch>/sing-box`；macOS 运行时使用 `bin/darwin-<arch>/xray`、`bin/darwin-<arch>/sing-box`。
 5. 运行时文件采用“仓库固定 + 哈希校验”，校验清单在 `publish/runtime-manifest.json`，固定来源清单在 `publish/runtime-sources.json`。
 6. 如需刷新 Linux / macOS 运行时，执行 `python3 tools/runtime/sync-runtime.py --target <target>`（会按固定来源下载、校验归档并更新 manifest）。
 
 开发模式说明：
 
-- `bat\dev.bat`：默认 `live` 模式，启动 Vite watcher，并通过 `-frontenddevserverurl` 接入桌面壳
-- `bat\dev.bat stable`：先构建 `frontend/dist`，再以静态资源模式启动 Wails，不依赖外部 Vite dev server
-- `bat\dev.bat live`：显式指定 `live` 模式，效果与默认一致
+- `bat\dev.bat`：默认 `stable` 模式，先构建 `frontend/dist`，再以静态资源模式启动 Wails，不依赖外部 Vite dev server
+- `bat\dev.bat stable`：显式指定 `stable` 模式，效果与默认一致
+- `bat\dev.bat live`：启动 Vite watcher，并通过 `-frontenddevserverurl` 接入桌面壳，支持热更新
 - `bat\dev.bat limited`：在 `live` 基础上为 watcher 与其子进程附加 Windows Job Object 内存限制
 - 如需为依赖下载配置代理，可在启动前设置 `DEV_PROXY_URL`、`DEV_NO_PROXY`、`DEV_GOPROXY`
 
@@ -306,6 +307,183 @@ chrome/
 3. 选择实例名称、内核、代理、标签和需要的启动参数
 4. 返回实例列表，点击启动按钮运行实例
 5. 打开 IP 检测网站，确认代理结果是否符合预期
+
+## 源码启动指南
+
+仓库包含单机桌面版和 Cloud 云端版两条产品线，各组件可以按需单独启动：
+
+| 组件 | 目录 | 说明 |
+| --- | --- | --- |
+| 经典桌面客户端 | `main.go`、`backend/`、`frontend/` | Wails + React 单机版，即上文介绍的桌面程序 |
+| Cloud 控制面 | `server/` | Go 实现的 API 网关（`cmd/control-plane`）、后台 Worker（`cmd/worker`）和迁移工具（`cmd/migrate`） |
+| Cloud 控制台 | `desktop/vue3-ui/` | Vue 3 控制台；同一份构建既用于 Web 部署，也嵌入 Cloud 桌面壳 |
+| Cloud 桌面壳 | `desktop/wails-client/` | 嵌入 Vue 控制台的 Wails 客户端 |
+| 桌面 Agent | `desktop/browser-agent/`、`backend/internal/cloudagent/` | 内置于桌面客户端，执行云端下发的实例启停、迁移和工作流 |
+
+### 环境要求
+
+- Go 1.25 或更高版本（`server/go.mod` 要求 1.25，同一版本也能构建根模块）
+- Node.js 22 与 npm（与 CI 一致）
+- Docker：PostgreSQL 模式、Compose 全栈和数据库集成测试需要
+- Wails CLI v2.12（仅桌面客户端需要）：`go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0`
+
+下文命令以 Windows PowerShell 为例。macOS / Linux 把 `$env:NAME = "value"` 换成 `export NAME="value"`，把行尾续行符 `` ` `` 换成 `\`。
+
+### 1. 经典桌面客户端
+
+按上文[从源码运行](#从源码运行)操作：Windows 执行 `bat\dev.bat`，macOS / Linux 执行 `./dev.sh`，需要热更新时加 `live` 参数。
+
+### 2. Cloud 控制面：内存模式（快速体验）
+
+不依赖数据库和其他服务：
+
+```powershell
+cd server
+$env:ANT_HTTP_ADDRESS = "127.0.0.1:8080"   # 不设置时监听所有网卡的 :8080
+go run ./cmd/control-plane
+```
+
+- 访问 `http://127.0.0.1:8080/healthz` 和 `http://127.0.0.1:8080/readyz` 确认服务可用。
+- `ANT_ENV` 默认为 `development`：数据只保存在内存中，进程退出即丢失；JWT 密钥和加密主密钥使用内置的开发值，不能用于生产。
+
+### 3. Cloud 控制面：本地 PostgreSQL 模式
+
+数据持久化，并和生产环境一样使用受行级安全（RLS）约束的运行时角色。示例密码只用于本机，请自行替换。
+
+1. 启动 PostgreSQL。`ant_migration` 是表的 owner，只用来执行迁移：
+
+   ```powershell
+   docker run -d --name ant-browser-pg -p 127.0.0.1:5432:5432 `
+     -e POSTGRES_DB=ant_browser -e POSTGRES_USER=ant_migration -e POSTGRES_PASSWORD=change-me-migration `
+     -v ant-browser-pg:/var/lib/postgresql/data postgres:16-alpine
+   ```
+
+2. 执行 `database/migrations` 下的迁移（只向前、有校验和保护，可以重复执行）：
+
+   ```powershell
+   cd server
+   $env:ANT_MIGRATION_DATABASE_URL = "postgres://ant_migration:change-me-migration@127.0.0.1:5432/ant_browser?sslmode=disable"
+   go run ./cmd/migrate up
+   ```
+
+3. 迁移以 `NOLOGIN` 方式创建 `ant_control_plane` 和 `ant_worker`，为它们开启登录：
+
+   ```powershell
+   docker exec ant-browser-pg psql -v ON_ERROR_STOP=1 -U ant_migration -d ant_browser `
+     -c "ALTER ROLE ant_control_plane WITH LOGIN PASSWORD 'change-me-control-plane';" `
+     -c "ALTER ROLE ant_worker WITH LOGIN PASSWORD 'change-me-worker';"
+   ```
+
+4. 以 `ant_control_plane` 身份启动控制面：
+
+   ```powershell
+   $env:ANT_HTTP_ADDRESS = "127.0.0.1:8080"
+   $env:ANT_DATABASE_URL = "postgres://ant_control_plane:change-me-control-plane@127.0.0.1:5432/ant_browser?sslmode=disable"
+   go run ./cmd/control-plane
+   ```
+
+5. 在另一个终端以 `ant_worker` 身份启动 Worker（任务队列、定时调度、通知投递）：
+
+   ```powershell
+   cd server
+   $env:ANT_WORKER_DATABASE_URL = "postgres://ant_worker:change-me-worker@127.0.0.1:5432/ant_browser?sslmode=disable"
+   go run ./cmd/worker
+   ```
+
+不配置 `ANT_REDIS_URL`、`ANT_NATS_URL`、`ANT_OBJECT_STORE_URL` 时，实时推送和任务唤醒只在各自进程内生效（Worker 仍会轮询 PostgreSQL 执行任务），云端 Profile 的文件内容也不会保存。需要完整链路时使用下面的 Compose 全栈。全部环境变量见 [server/README.md](server/README.md)。
+
+### 4. Cloud 全栈：Docker Compose
+
+一次启动 PostgreSQL、Redis、NATS、MinIO、数据库迁移、控制面、Worker、Vue 控制台和 Nginx：
+
+```sh
+cp deploy/.env.example deploy/.env   # 按文件内注释替换所有 replace-with-... 值
+docker compose --env-file deploy/.env -f deploy/compose/docker-compose.yml up --build
+```
+
+- 控制台和 API 统一通过 `http://localhost:8088` 访问（端口由 `HTTP_PORT` 决定），`/readyz` 返回 200 即就绪。
+- 停止：`docker compose --env-file deploy/.env -f deploy/compose/docker-compose.yml down`。
+- 密钥生成方法、复用数据卷时的角色授权和代理健康探测见 [docs/cloud-deployment.md](docs/cloud-deployment.md)。
+
+### 5. Vue 3 控制台（开发模式）
+
+先按第 2 或第 3 步启动控制面，再执行：
+
+```powershell
+cd desktop/vue3-ui
+npm ci
+npm run dev -- --host 127.0.0.1 --port 4173 --strictPort
+```
+
+- 打开 `http://127.0.0.1:4173`，注册账号，在「团队空间」新建工作空间后即可使用。登录页的「连接设置」可以修改 Cloud API 地址，默认是 `http://127.0.0.1:8080`，也可以通过 `VITE_API_BASE_URL` 指定。
+- 开发环境的控制面只允许 `http://127.0.0.1:4173`、`http://localhost:4173` 和 `http://wails.localhost` 跨域访问。换端口时需要给控制面设置 `ANT_ALLOWED_ORIGINS`（逗号分隔的完整 Origin）。
+- `npm run build` 先执行 `vue-tsc` 类型检查，产物输出到 `desktop/wails-client/frontend/dist`，供 Cloud 桌面壳和前端镜像使用。
+
+### 6. Cloud 桌面壳（Wails + Vue 3）
+
+```powershell
+cd desktop/vue3-ui
+npm ci
+npm run build        # 生成 desktop/wails-client/frontend/dist，go:embed 依赖该目录
+cd ../wails-client
+wails dev            # 开发模式，前端使用 Vite 热更新
+wails build          # 打包，产物位于 desktop/wails-client/build/bin/
+```
+
+`frontend/dist` 和 `desktop/wails-client/frontend/dist` 两个 `go:embed` 目录都不入库。在根目录执行 `go build ./...` 或 `go test ./...` 之前，需要先分别在 `frontend/` 和 `desktop/vue3-ui/` 下执行 `npm run build`。
+
+### 7. 桌面 Agent 接入 Cloud
+
+Agent 默认关闭，经典桌面客户端和 Cloud 桌面壳都可以通过环境变量启用：
+
+1. 在控制台的「设备管理」中注册设备，记下设备 ID 和只显示一次的设备凭据。
+2. 在任意绝对路径创建配置文件，例如 `D:\ant-cloud\agent.json`：
+
+   ```json
+   {
+     "baseUrl": "https://cloud.example.com",
+     "deviceId": "<设备 ID>",
+     "workspaceId": "<工作空间 ID>",
+     "bindings": { "<云端实例 ID>": "<本地实例 ID>" }
+   }
+   ```
+
+   `baseUrl` 必须是不带路径的 HTTPS 地址，本机联调时需要在控制面前加一层 TLS 反向代理。启用云端 Profile 同步时再增加 `cloudProfiles`（云端实例 ID 到云端 Profile ID 的映射）。
+
+3. 在同一个终端设置环境变量，然后启动桌面客户端（例如 `bat\dev.bat`）：
+
+   ```powershell
+   $env:ANT_CLOUD_COMMANDS_ENABLED = "true"
+   $env:ANT_CLOUD_COMMANDS_CONFIG = "D:\ant-cloud\agent.json"
+   $env:ANT_CLOUD_DEVICE_CREDENTIAL = "<设备凭据>"
+   # 仅在配置了 cloudProfiles 时需要：
+   $env:ANT_CLOUD_PROFILE_ENCRYPTION_KEY = "<base64 编码的 32 字节随机密钥>"
+   $env:ANT_CLOUD_PROFILE_ENCRYPTION_KEY_REF = "<与控制面 ANT_ENCRYPTION_KEY_REF 相同>"
+   ```
+
+执行云端工作流还需要设置 `ANT_CLOUD_WORKFLOWS_ENABLED=true` 和 `ANT_CLOUD_WORKFLOWS_CONFIG`（可以指向同一个配置文件），并要求本地自动化运行时已安装、Launch API 已开启密钥认证。设备凭据只通过环境变量传入，不要写进配置文件或提交到仓库。
+
+### 8. 运行测试
+
+```powershell
+# Cloud 控制面：单元测试与 HTTP 接口测试
+cd server
+go test ./...
+
+# PostgreSQL 集成测试：只能连接一次性测试库（测试会修改运行时角色的密码）
+docker run --rm -d --name ant-browser-pg-test -p 127.0.0.1:55432:5432 `
+  -e POSTGRES_DB=ant_browser_test -e POSTGRES_USER=ant_browser -e POSTGRES_PASSWORD=integration-test-only postgres:16-alpine
+# 等待数据库就绪（约几秒）后执行
+$env:ANT_TEST_DATABASE_URL = "postgres://ant_browser:integration-test-only@127.0.0.1:55432/ant_browser_test?sslmode=disable"
+go test ./platform/postgres/...
+docker stop ant-browser-pg-test
+
+# 桌面端根模块（需要先构建两套前端，见第 6 步）
+cd ..
+go test ./...
+```
+
+前端分别在 `frontend/` 和 `desktop/vue3-ui/` 下执行 `npm run build`，两者都包含 TypeScript 类型检查。
 
 ## 常用操作
 
