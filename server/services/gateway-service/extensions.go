@@ -2,6 +2,7 @@ package gatewayservice
 
 import (
 	"net/http"
+	"sort"
 
 	"github.com/zerlinpi/Ant-Browser/server/platform/httpx"
 )
@@ -25,11 +26,24 @@ type (
 	protectedMiddleware func(g *Gateway, next http.Handler) http.Handler
 )
 
+// Protected middleware order, outermost first. Access guards run before
+// anything that records or replays a request.
+const (
+	MiddlewareOrderAccessGuard = 100
+	MiddlewareOrderPolicy      = 200
+	MiddlewareOrderIdempotency = 300
+)
+
+type orderedMiddleware struct {
+	order      int
+	middleware protectedMiddleware
+}
+
 var (
 	routeRegistrars      []routeRegistrar
 	optionHandlers       []optionHandler
 	errorMappers         []errorMapper
-	protectedMiddlewares []protectedMiddleware
+	protectedMiddlewares []orderedMiddleware
 )
 
 func registerRoutes(registrar routeRegistrar) { routeRegistrars = append(routeRegistrars, registrar) }
@@ -37,9 +51,13 @@ func registerOption(handler optionHandler)    { optionHandlers = append(optionHa
 func registerErrorMapper(mapper errorMapper)  { errorMappers = append(errorMappers, mapper) }
 
 // registerProtectedMiddleware adds middleware around the authenticated
-// routes. The first registered middleware is the outermost.
-func registerProtectedMiddleware(middleware protectedMiddleware) {
-	protectedMiddlewares = append(protectedMiddlewares, middleware)
+// routes. Lower order values wrap outside higher ones; equal values keep
+// registration order.
+func registerProtectedMiddleware(order int, middleware protectedMiddleware) {
+	protectedMiddlewares = append(protectedMiddlewares, orderedMiddleware{order: order, middleware: middleware})
+	sort.SliceStable(protectedMiddlewares, func(i, j int) bool {
+		return protectedMiddlewares[i].order < protectedMiddlewares[j].order
+	})
 }
 
 // extensionKey gives each extension value type its own map key.
@@ -73,7 +91,7 @@ func (g *Gateway) registerExtensionRoutes(public, protected *http.ServeMux) {
 
 func (g *Gateway) wrapProtected(handler http.Handler) http.Handler {
 	for index := len(protectedMiddlewares) - 1; index >= 0; index-- {
-		handler = protectedMiddlewares[index](g, handler)
+		handler = protectedMiddlewares[index].middleware(g, handler)
 	}
 	return handler
 }

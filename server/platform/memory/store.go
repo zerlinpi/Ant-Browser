@@ -96,6 +96,11 @@ type Store struct {
 	licenseByHash      map[string]string
 	releaseChannels    map[string]billingservice.ReleaseChannel
 	releaseByCode      map[string]string
+
+	// features holds per-feature state; see extensions.go. featuresMu guards
+	// the map itself; the state inside is guarded by mu.
+	featuresMu sync.Mutex
+	features   map[interface{}]interface{}
 }
 
 func New() *Store {
@@ -130,6 +135,7 @@ func New() *Store {
 		usageCounters: make(map[string]billingservice.UsageCounter), usageReservations: make(map[string]billingservice.UsageReservation), usageByIdempotency: make(map[string]string),
 		licenses: make(map[string]billingservice.LicenseActivation), licenseByHash: make(map[string]string),
 		releaseChannels: make(map[string]billingservice.ReleaseChannel), releaseByCode: make(map[string]string),
+		features: make(map[interface{}]interface{}),
 	}
 	// Keep local development useful out of the box while production seeds the
 	// same catalog through an explicitly trusted bootstrap operation.
