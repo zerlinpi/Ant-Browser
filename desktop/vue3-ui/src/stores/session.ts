@@ -116,6 +116,15 @@ export const useSessionStore = defineStore("session", () => {
   };
 
   /**
+   * Signs in with a token pair obtained outside `login` (for example an
+   * OAuth exchange). Resolves once the identity and workspaces are loaded.
+   */
+  const adoptTokens = async (pair: AuthTokenPair) => {
+    if (!pair?.accessToken || !pair.refreshToken) throw new ApiError("登录响应无效，请稍后重试", 0, "invalid_response");
+    await establish(pair);
+  };
+
+  /**
    * Checks the password. Resolves to null once signed in, or to the challenge
    * that `verifyMFA` must complete when the account has two-factor
    * authentication.
@@ -198,6 +207,7 @@ export const useSessionStore = defineStore("session", () => {
     bootstrap,
     login,
     verifyMFA,
+    adoptTokens,
     register,
     logout,
     selectWorkspace,

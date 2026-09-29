@@ -274,6 +274,14 @@ const errorCodeMessages: Record<string, string> = {
   batch_dependency_unavailable: "批量服务暂不可用，请稍后重试",
 };
 
+/**
+ * Adds localized messages for a feature's error codes. Feature modules call
+ * this once at import time instead of editing the shared table above.
+ */
+export const registerErrorMessages = (messages: Record<string, string>) => {
+  Object.assign(errorCodeMessages, messages);
+};
+
 const formatWait = (seconds: number) => (seconds < 60 ? `${seconds} 秒` : `约 ${Math.ceil(seconds / 60)} 分钟`);
 
 /** User-facing message for any thrown value; `overrides` maps error codes to context-specific copy. */
