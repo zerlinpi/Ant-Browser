@@ -10,15 +10,33 @@ import (
 	"github.com/zerlinpi/Ant-Browser/server/platform/postgres"
 )
 
+const usage = "usage: migrate [up | preflight [-fix]]"
+
 func main() {
-	if len(os.Args) > 1 && os.Args[1] != "up" {
-		fmt.Fprintln(os.Stderr, "only forward migration command 'up' is supported")
+	command, args := "up", []string(nil)
+	if len(os.Args) > 1 {
+		command, args = os.Args[1], os.Args[2:]
+	}
+	switch command {
+	case "up":
+		os.Exit(runUp())
+	case "preflight":
+		databaseURL, ok := migrationDatabaseURL()
+		if !ok {
+			os.Exit(2)
+		}
+		os.Exit(runPreflight(context.Background(), databaseURL, args, os.Stdout, os.Stderr))
+	default:
+		fmt.Fprintln(os.Stderr, "only the forward migration command 'up' and the read-only check 'preflight' are supported")
+		fmt.Fprintln(os.Stderr, usage)
 		os.Exit(2)
 	}
-	databaseURL := firstEnvironment("ANT_MIGRATION_DATABASE_URL", "ANT_DATABASE_URL", "DATABASE_URL")
-	if databaseURL == "" {
-		fmt.Fprintln(os.Stderr, "ANT_MIGRATION_DATABASE_URL is required (use the migration role)")
-		os.Exit(2)
+}
+
+func runUp() int {
+	databaseURL, ok := migrationDatabaseURL()
+	if !ok {
+		return 2
 	}
 	migrationsPath := firstEnvironment("ANT_MIGRATIONS_PATH", "MIGRATIONS_PATH")
 	if migrationsPath == "" {
@@ -26,9 +44,21 @@ func main() {
 	}
 	if err := postgres.Migrate(context.Background(), databaseURL, migrationsPath); err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return 1
 	}
 	fmt.Printf("migrations applied from %s\n", migrationsPath)
+	return 0
+}
+
+// migrationDatabaseURL is shared by up and preflight: both need the
+// migration role, which owns the tables.
+func migrationDatabaseURL() (string, bool) {
+	databaseURL := firstEnvironment("ANT_MIGRATION_DATABASE_URL", "ANT_DATABASE_URL", "DATABASE_URL")
+	if databaseURL == "" {
+		fmt.Fprintln(os.Stderr, "ANT_MIGRATION_DATABASE_URL is required (use the migration role)")
+		return "", false
+	}
+	return databaseURL, true
 }
 
 func firstEnvironment(names ...string) string {
