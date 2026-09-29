@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,14 +34,25 @@ func (s *Store) CreateWorkflow(_ context.Context, workflow automationservice.Wor
 	state := s.automation()
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	for _, current := range state.workflows {
-		if current.WorkspaceID == workflow.WorkspaceID && current.Name == workflow.Name {
-			return automationservice.ErrNameConflict
-		}
+	if state.workflowNameTakenLocked(workflow.WorkspaceID, workflow.Name) {
+		return automationservice.ErrNameConflict
 	}
 	state.workflows[workflow.ID] = workflow
 	state.versions[workflow.ID] = map[int]automationservice.WorkflowVersion{version.Version: cloneWorkflowVersion(version)}
 	return nil
+}
+
+// workflowNameTakenLocked mirrors workflows_lower_name_uq (migration 031):
+// names are unique per workspace ignoring letter case, archived workflows
+// included. Workflows cannot be renamed, so creation is the only caller.
+// Callers hold state.mu.
+func (state *automationState) workflowNameTakenLocked(workspaceID, name string) bool {
+	for _, current := range state.workflows {
+		if current.WorkspaceID == workspaceID && strings.EqualFold(current.Name, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) FindWorkflow(_ context.Context, workspaceID, workflowID string) (automationservice.Workflow, error) {

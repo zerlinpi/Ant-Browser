@@ -39,7 +39,7 @@ func (s *Store) CreateWorkflow(ctx context.Context, workflow automationservice.W
 		workflow.LatestVersion, workflow.PublishedVersionID, workflow.Version,
 		workflow.CreatedBy, workflow.CreatedAt, workflow.UpdatedAt, workflow.ArchivedAt)
 	if err != nil {
-		if isUniqueViolationOn(err, workflowNameConstraint) {
+		if isUniqueViolationOn(err, workflowNameIndex) {
 			return automationservice.ErrNameConflict
 		}
 		if isForeignKeyViolation(err) {

@@ -257,7 +257,7 @@ const errorCodeMessages: Record<string, string> = {
   instance_name_conflict: "已有同名实例（不区分大小写），请更换名称",
   proxy_name_conflict: "已有同名代理（不区分大小写），请更换名称",
   profile_name_conflict: "已有同名云端档案（不区分大小写），请更换名称",
-  workflow_name_conflict: "已有同名工作流（含已归档），请更换名称",
+  workflow_name_conflict: "已有同名工作流（不区分大小写，含已归档），请更换名称",
   account_identifier_conflict: "同平台已存在相同标识的账号（不区分大小写），请更换账号标识",
   invalid_cron_expression: "Cron 表达式无效，请使用五段格式：分 时 日 月 周",
   invalid_timezone: "时区无效，请填写 IANA 时区，例如 Asia/Shanghai",
