@@ -202,18 +202,25 @@ const schedulePath = (id: string) => `${session.workspaceBase}/schedules/${encod
 
 const cronRanges: Array<[number, number]> = [[0, 59], [0, 23], [1, 31], [1, 12], [0, 6]];
 const cronFieldNames = ["分钟", "小时", "日", "月", "星期"];
-/** Mirrors ParseCron in server/services/schedule-service/cron.go (some of its errors surface as 500). */
+// Go's strings.Fields splits on Unicode White_Space; JS \s also matches U+FEFF
+// and misses U+0085, so the separator set is spelled out.
+const cronSeparators = /[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/;
+/**
+ * Mirrors ParseCron in server/services/schedule-service/cron.go. Items are `*`, `N` or `N-M` with an
+ * optional step `/S` (S ≥ 1); numbers are unsigned digits. A step counts from the item's start, so `N/S`
+ * means `N-max/S`, and a step larger than the span yields only the start.
+ */
 const cronProblem = (expression: string) => {
-  const parts = expression.trim().split(/\s+/).filter(Boolean);
+  const parts = expression.split(cronSeparators).filter(Boolean);
   if (parts.length !== 5) return "Cron 表达式需为五段：分 时 日 月 周";
   for (const [index, part] of parts.entries()) {
     const [min, max] = cronRanges[index];
     const valid = part.split(",").every((item) => {
       const match = /^(\*|(\d+)(?:-(\d+))?)(?:\/(\d+))?$/.exec(item);
-      if (!match || (match[4] !== undefined && Number(match[4]) <= 0)) return false;
+      if (!match || (match[4] !== undefined && Number(match[4]) < 1)) return false;
       if (match[1] === "*") return true;
       const start = Number(match[2]);
-      const end = match[3] === undefined ? start : Number(match[3]);
+      const end = match[3] !== undefined ? Number(match[3]) : match[4] !== undefined ? max : start;
       return start >= min && end <= max && start <= end;
     });
     if (!valid) return `Cron 第 ${index + 1} 段（${cronFieldNames[index]}）无效，取值 ${min}–${max}`;

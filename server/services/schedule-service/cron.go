@@ -3,6 +3,7 @@ package scheduleservice
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +16,13 @@ var ErrInvalidCron = errors.New("invalid cron expression")
 
 // Cron is the intentionally small, standard five-field cron dialect used by
 // schedules. Fields are minute, hour, day-of-month, month, day-of-week.
+//
+// Each field is a comma-separated list of items. An item is "*", a number
+// "N" or a range "N-M", optionally followed by a step "/S" with S >= 1.
+// As in Vixie/ISC cron a step counts from the start of its item: "*/S"
+// covers the whole field, "N-M/S" the range and "N/S" runs from N to the
+// field maximum. A step larger than the span yields only the start. Numbers
+// are unsigned decimal digits.
 type Cron struct{ fields [5]field }
 type field struct {
 	values       map[int]bool
@@ -22,15 +30,20 @@ type field struct {
 	unrestricted bool
 }
 
+// cronRanges are the inclusive bounds of the five fields; day-of-week runs
+// from 0 (Sunday) to 6.
+var cronRanges = [5][2]int{{0, 59}, {0, 23}, {1, 31}, {1, 12}, {0, 6}}
+
+var cronFieldNames = [5]string{"minute", "hour", "day-of-month", "month", "day-of-week"}
+
 func ParseCron(expression string) (Cron, error) {
 	parts := strings.Fields(strings.TrimSpace(expression))
 	if len(parts) != 5 {
 		return Cron{}, fmt.Errorf("%w: cron expression must contain five fields", ErrInvalidCron)
 	}
-	ranges := [5][2]int{{0, 59}, {0, 23}, {1, 31}, {1, 12}, {0, 6}}
 	var result Cron
 	for i, part := range parts {
-		f, err := parseField(part, ranges[i][0], ranges[i][1])
+		f, err := parseField(part, cronRanges[i][0], cronRanges[i][1])
 		if err != nil {
 			return Cron{}, fmt.Errorf("%w: cron field %d: %v", ErrInvalidCron, i+1, err)
 		}
@@ -40,61 +53,153 @@ func ParseCron(expression string) (Cron, error) {
 }
 
 func parseField(raw string, min, max int) (field, error) {
+	// Only a bare "*" leaves the field unrestricted; "*/S" restricts it,
+	// which matters for the day-of-month/day-of-week combination.
 	f := field{values: map[int]bool{}, min: min, max: max, unrestricted: strings.TrimSpace(raw) == "*"}
 	for _, item := range strings.Split(raw, ",") {
 		item = strings.TrimSpace(item)
 		if item == "" {
 			return field{}, errors.New("empty item")
 		}
-		base, step := item, 1
-		if strings.Contains(item, "/") {
-			parts := strings.Split(item, "/")
-			if len(parts) != 2 {
-				return field{}, errors.New("invalid step")
-			}
-			base = parts[0]
-			parsed, err := strconv.Atoi(parts[1])
-			if err != nil || parsed <= 0 {
-				return field{}, errors.New("step must be positive")
-			}
-			step = parsed
+		start, end, step, err := parseItem(item, min, max)
+		if err != nil {
+			return field{}, err
 		}
-		start, end := min, max
-		if base != "*" {
-			if strings.Contains(base, "-") {
-				parts := strings.Split(base, "-")
-				if len(parts) != 2 {
-					return field{}, errors.New("invalid range")
-				}
-				var err error
-				start, err = strconv.Atoi(parts[0])
-				if err != nil {
-					return field{}, errors.New("invalid range")
-				}
-				end, err = strconv.Atoi(parts[1])
-				if err != nil {
-					return field{}, errors.New("invalid range")
-				}
-			} else {
-				var err error
-				start, err = strconv.Atoi(base)
-				if err != nil {
-					return field{}, errors.New("invalid value")
-				}
-				end = start
-			}
-		}
-		if start < min || end > max || start > end {
-			return field{}, fmt.Errorf("value must be between %d and %d", min, max)
-		}
-		for value := start; value <= end; value += step {
+		// Stopping once the remaining span is shorter than the step never
+		// computes a value past end, so even a saturated step cannot overflow.
+		for value := start; ; value += step {
 			f.values[value] = true
+			if end-value < step {
+				break
+			}
 		}
 	}
 	if len(f.values) == 0 {
 		return field{}, errors.New("field has no values")
 	}
 	return f, nil
+}
+
+// parseItem returns the first value, the inclusive bound and the step of one
+// list item.
+func parseItem(item string, min, max int) (start, end, step int, err error) {
+	base, stepText, stepped := strings.Cut(item, "/")
+	step = 1
+	if stepped {
+		if strings.Contains(stepText, "/") {
+			return 0, 0, 0, errors.New("invalid step")
+		}
+		if step, err = parseStep(stepText); err != nil {
+			return 0, 0, 0, err
+		}
+	}
+	switch {
+	case base == "*":
+		start, end = min, max
+	case strings.Contains(base, "-"):
+		low, high, _ := strings.Cut(base, "-")
+		var lowErr, highErr error
+		start, lowErr = parseNumber(low)
+		end, highErr = parseNumber(high)
+		if lowErr != nil || highErr != nil {
+			return 0, 0, 0, errors.New("invalid range")
+		}
+	default:
+		if start, err = parseNumber(base); err != nil {
+			return 0, 0, 0, errors.New("invalid value")
+		}
+		end = start
+		if stepped {
+			// "N/S" means "N-max/S".
+			end = max
+		}
+	}
+	if start < min || end > max || start > end {
+		return 0, 0, 0, fmt.Errorf("value must be between %d and %d", min, max)
+	}
+	return start, end, step, nil
+}
+
+// parseNumber accepts unsigned decimal digits only. strconv.Atoi alone would
+// also accept a sign such as "+5", which cron does not.
+func parseNumber(text string) (int, error) {
+	if !isDigits(text) {
+		return 0, errors.New("not a number")
+	}
+	return strconv.Atoi(text)
+}
+
+// parseStep accepts any unsigned decimal step of at least 1. A step beyond
+// the int range saturates: it exceeds every field span, so like any other
+// step larger than the span it yields only the start.
+func parseStep(text string) (int, error) {
+	if !isDigits(text) {
+		return 0, errors.New("step must be positive")
+	}
+	step, err := strconv.Atoi(text)
+	if errors.Is(err, strconv.ErrRange) {
+		step, err = math.MaxInt, nil
+	}
+	if err != nil || step < 1 {
+		return 0, errors.New("step must be positive")
+	}
+	return step, nil
+}
+
+func isDigits(text string) bool {
+	if text == "" {
+		return false
+	}
+	for i := 0; i < len(text); i++ {
+		if text[i] < '0' || text[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// StepChange describes a list item written as "N/S". Before the Vixie/ISC
+// step semantics such an item selected only N; it now selects N-max/S.
+type StepChange struct {
+	// Field is the 1-based field number and FieldName its name (minute,
+	// hour, day-of-month, month or day-of-week).
+	Field     int
+	FieldName string
+	// Item is the item as written and Start its N. Expanded is the explicit
+	// range form, such as "5-59/15" for "5/15" in the minute field.
+	Item     string
+	Start    int
+	Expanded string
+	// Changed is false when the step exceeds the rest of the field, so the
+	// item still selects only N.
+	Changed bool
+}
+
+// NumericStartSteps lists the "N/S" items of an expression that ParseCron
+// accepts, in field order. The migration preflight uses it to list
+// schedules whose meaning changed with the step semantics.
+func NumericStartSteps(expression string) []StepChange {
+	if _, err := ParseCron(expression); err != nil {
+		return nil
+	}
+	var changes []StepChange
+	for index, part := range strings.Fields(expression) {
+		for _, item := range strings.Split(part, ",") {
+			base, stepText, stepped := strings.Cut(strings.TrimSpace(item), "/")
+			if !stepped || !isDigits(base) {
+				continue
+			}
+			start, _ := parseNumber(base)
+			step, _ := parseStep(stepText)
+			max := cronRanges[index][1]
+			changes = append(changes, StepChange{
+				Field: index + 1, FieldName: cronFieldNames[index],
+				Item: item, Start: start, Expanded: fmt.Sprintf("%d-%d/%s", start, max, stepText),
+				Changed: max-start >= step,
+			})
+		}
+	}
+	return changes
 }
 
 func (c Cron) matches(t time.Time) bool {
