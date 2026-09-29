@@ -7,84 +7,44 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	notificationservice "github.com/zerlinpi/Ant-Browser/server/services/notification-service"
 )
 
+// CreateNotification stores a notification with its in-app, WebSocket and
+// email deliveries through publish_notification (migration 032). The
+// function runs as a dedicated role, so ant_worker can publish without any
+// privilege on the notification tables, while the tenant policies still pin
+// every row to the workspace the caller's transaction is scoped to. A replay
+// of an idempotency key returns the stored notification when it matches and
+// ErrConflict otherwise.
 func (s *Store) CreateNotification(ctx context.Context, item notificationservice.Notification, idempotencyKey string) (notificationservice.Notification, error) {
 	payload, err := json.Marshal(item.Payload)
 	if err != nil {
 		return notificationservice.Notification{}, err
 	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return notificationservice.Notification{}, err
-	}
-	defer rollback(ctx, tx)
-	var existing notificationservice.Notification
-	var existingPayload []byte
-	err = tx.QueryRow(ctx, `INSERT INTO notifications
-		(id,workspace_id,recipient_user_id,event_type,title,body,payload,created_at,idempotency_key)
-		VALUES ($1::uuid,$2::uuid,$3::uuid,$4,$5,$6,$7::jsonb,$8,$9)
-		ON CONFLICT (workspace_id,recipient_user_id,idempotency_key) WHERE idempotency_key <> ''
-		DO UPDATE SET id=notifications.id
-		RETURNING id::text,workspace_id::text,recipient_user_id::text,event_type,title,body,payload,read_at,created_at`,
+	var stored notificationservice.Notification
+	var storedPayload []byte
+	err = s.pool.QueryRow(ctx, `SELECT id::text,workspace_id::text,recipient_user_id::text,event_type,title,body,payload,read_at,created_at
+		FROM publish_notification($1::uuid,$2::uuid,$3::uuid,$4,$5,$6,$7::jsonb,$8,$9)`,
 		item.ID, item.WorkspaceID, item.RecipientUserID, item.EventType, item.Title, item.Body, payload, item.CreatedAt, idempotencyKey,
-	).Scan(&existing.ID, &existing.WorkspaceID, &existing.RecipientUserID, &existing.EventType, &existing.Title, &existing.Body, &existingPayload, &existing.ReadAt, &existing.CreatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
+	).Scan(&stored.ID, &stored.WorkspaceID, &stored.RecipientUserID, &stored.EventType, &stored.Title, &stored.Body, &storedPayload, &stored.ReadAt, &stored.CreatedAt)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows), isForeignKeyViolation(err):
 		return notificationservice.Notification{}, notificationservice.ErrNotFound
-	}
-	if isForeignKeyViolation(err) {
-		return notificationservice.Notification{}, notificationservice.ErrNotFound
-	}
-	if err != nil {
-		return notificationservice.Notification{}, err
-	}
-	_ = json.Unmarshal(existingPayload, &existing.Payload)
-	if existing.EventType != item.EventType || existing.Title != item.Title || existing.Body != item.Body || payloadJSON(existing.Payload) != payloadJSON(item.Payload) {
+	case isNotificationConflict(err):
 		return notificationservice.Notification{}, notificationservice.ErrConflict
-	}
-	// The notification row itself is the completed in-app delivery. WebSocket
-	// delivery defaults on unless the recipient disabled it; email is opt-in.
-	if _, err := tx.Exec(ctx, `INSERT INTO notification_deliveries
-		(id,workspace_id,notification_id,channel,status,attempts,sent_at,created_at,updated_at)
-		VALUES (gen_random_uuid(),$1::uuid,$2::uuid,'in_app','sent',1,$3,$3,$3)
-		ON CONFLICT (workspace_id,notification_id,channel) DO UPDATE
-		SET status='sent',attempts=GREATEST(notification_deliveries.attempts,1),
-			sent_at=COALESCE(notification_deliveries.sent_at,EXCLUDED.sent_at),
-			next_attempt_at=NULL,last_error_code='',updated_at=EXCLUDED.updated_at`,
-		item.WorkspaceID, existing.ID, existing.CreatedAt); err != nil {
+	case err != nil:
 		return notificationservice.Notification{}, err
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO notification_deliveries
-		(id,workspace_id,notification_id,channel,status,attempts,next_attempt_at,created_at,updated_at)
-		SELECT gen_random_uuid(),$1::uuid,$2::uuid,'websocket','pending',0,$4,$4,$4
-		WHERE COALESCE((
-			SELECT preference.enabled FROM notification_preferences preference
-			WHERE preference.workspace_id=$1::uuid AND preference.user_id=$3::uuid
-			  AND preference.channel='websocket' AND preference.event_type IN ($5,'*')
-			ORDER BY (preference.event_type=$5) DESC LIMIT 1
-		),true)
-		ON CONFLICT (workspace_id,notification_id,channel) DO NOTHING`,
-		item.WorkspaceID, existing.ID, existing.RecipientUserID, existing.CreatedAt, existing.EventType); err != nil {
-		return notificationservice.Notification{}, err
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO notification_deliveries
-		(id,workspace_id,notification_id,channel,status,attempts,next_attempt_at,created_at,updated_at)
-		SELECT gen_random_uuid(),$1::uuid,$2::uuid,'email','pending',0,$4,$4,$4
-		WHERE COALESCE((
-			SELECT preference.enabled FROM notification_preferences preference
-			WHERE preference.workspace_id=$1::uuid AND preference.user_id=$3::uuid
-			  AND preference.channel='email' AND preference.event_type IN ($5,'*')
-			ORDER BY (preference.event_type=$5) DESC LIMIT 1
-		),false)
-		ON CONFLICT (workspace_id,notification_id,channel) DO NOTHING`,
-		item.WorkspaceID, existing.ID, existing.RecipientUserID, existing.CreatedAt, existing.EventType); err != nil {
-		return notificationservice.Notification{}, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return notificationservice.Notification{}, err
-	}
-	return existing, nil
+	_ = json.Unmarshal(storedPayload, &stored.Payload)
+	return stored, nil
+}
+
+// isNotificationConflict reports publish_notification's idempotency error.
+func isNotificationConflict(err error) bool {
+	var pgError *pgconn.PgError
+	return errors.As(err, &pgError) && pgError.Code == "P0001" && pgError.ConstraintName == "notification_idempotency_conflict"
 }
 
 func (s *Store) ListNotifications(ctx context.Context, workspaceID, recipientID string, limit, offset int, unreadOnly bool) ([]notificationservice.Notification, error) {
@@ -190,14 +150,6 @@ func scanNotification(row scanner) (notificationservice.Notification, error) {
 	}
 	_ = json.Unmarshal(payload, &item.Payload)
 	return item, nil
-}
-
-func payloadJSON(payload map[string]interface{}) string {
-	if payload == nil {
-		payload = map[string]interface{}{}
-	}
-	encoded, _ := json.Marshal(payload)
-	return string(encoded)
 }
 
 func (s *Store) ClaimNotificationDeliveries(ctx context.Context, workerID string, channels []string, limit int, leaseTTL time.Duration, _ time.Time) ([]notificationservice.Delivery, error) {

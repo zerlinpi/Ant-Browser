@@ -194,12 +194,14 @@ func (s *Store) CreateProxyHealthCheck(ctx context.Context, check proxyservice.H
 	return tx.Commit(ctx)
 }
 
+// Health check reads use host(ip): ip::text would append the prefix length
+// ("203.0.113.10/32"), unlike the memory store and the probe's result.
 func (s *Store) FindProxyHealthCheck(ctx context.Context, workspaceID, checkID string) (proxyservice.HealthCheck, error) {
-	return scanHealthCheck(s.pool.QueryRow(ctx, `SELECT id::text,workspace_id::text,proxy_id::text,request_id::text,connector_type,kernel,status,COALESCE(ip::text,''),COALESCE(latency_ms,0),COALESCE(error_code,''),COALESCE(error_message,''),COALESCE(created_by::text,''),created_at,completed_at FROM proxy_health_checks WHERE workspace_id=$1::uuid AND id=$2::uuid`, workspaceID, checkID))
+	return scanHealthCheck(s.pool.QueryRow(ctx, `SELECT id::text,workspace_id::text,proxy_id::text,request_id::text,connector_type,kernel,status,COALESCE(host(ip),''),COALESCE(latency_ms,0),COALESCE(error_code,''),COALESCE(error_message,''),COALESCE(created_by::text,''),created_at,completed_at FROM proxy_health_checks WHERE workspace_id=$1::uuid AND id=$2::uuid`, workspaceID, checkID))
 }
 
 func (s *Store) ListProxyHealthChecks(ctx context.Context, workspaceID, proxyID string, limit int) ([]proxyservice.HealthCheck, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id::text,workspace_id::text,proxy_id::text,request_id::text,connector_type,kernel,status,COALESCE(ip::text,''),COALESCE(latency_ms,0),COALESCE(error_code,''),COALESCE(error_message,''),COALESCE(created_by::text,''),created_at,completed_at FROM proxy_health_checks WHERE workspace_id=$1::uuid AND ($2='' OR proxy_id=NULLIF($2,'')::uuid) ORDER BY created_at DESC LIMIT $3`, workspaceID, proxyID, limit)
+	rows, err := s.pool.Query(ctx, `SELECT id::text,workspace_id::text,proxy_id::text,request_id::text,connector_type,kernel,status,COALESCE(host(ip),''),COALESCE(latency_ms,0),COALESCE(error_code,''),COALESCE(error_message,''),COALESCE(created_by::text,''),created_at,completed_at FROM proxy_health_checks WHERE workspace_id=$1::uuid AND ($2='' OR proxy_id=NULLIF($2,'')::uuid) ORDER BY created_at DESC LIMIT $3`, workspaceID, proxyID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -225,12 +227,12 @@ func (s *Store) CompleteProxyHealthCheck(ctx context.Context, workspaceID, check
 		status=$3,ip=NULLIF($4,'')::inet,latency_ms=$5,error_code=$6,error_message=$7,completed_at=$8
 		WHERE workspace_id=$1::uuid AND id=$2::uuid AND completed_at IS NULL
 		RETURNING id::text,workspace_id::text,proxy_id::text,request_id::text,connector_type,kernel,status,
-		COALESCE(ip::text,''),COALESCE(latency_ms,0),COALESCE(error_code,''),COALESCE(error_message,''),
+		COALESCE(host(ip),''),COALESCE(latency_ms,0),COALESCE(error_code,''),COALESCE(error_message,''),
 		COALESCE(created_by::text,''),created_at,completed_at`,
 		workspaceID, checkID, result.Status, result.IP, result.LatencyMS, result.ErrorCode, result.ErrorMessage, now))
 	if errors.Is(err, proxyservice.ErrNotFound) {
 		existing, findErr := scanHealthCheck(tx.QueryRow(ctx, `SELECT id::text,workspace_id::text,proxy_id::text,
-			request_id::text,connector_type,kernel,status,COALESCE(ip::text,''),COALESCE(latency_ms,0),
+			request_id::text,connector_type,kernel,status,COALESCE(host(ip),''),COALESCE(latency_ms,0),
 			COALESCE(error_code,''),COALESCE(error_message,''),COALESCE(created_by::text,''),created_at,completed_at
 			FROM proxy_health_checks WHERE workspace_id=$1::uuid AND id=$2::uuid`, workspaceID, checkID))
 		if findErr != nil {

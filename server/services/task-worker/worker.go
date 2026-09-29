@@ -174,6 +174,9 @@ func (w *Worker) publishTerminalFailure(ctx context.Context, lease taskservice.L
 	if w.notifications == nil || lease.Task.RequestedBy == "" {
 		return
 	}
+	// Notifications are workspace rows: publish under the task's workspace
+	// scope, like the handler, or the tenant policies reject the insert.
+	ctx = postgres.WithTenantScope(ctx, postgres.TenantScope{WorkspaceID: lease.Task.WorkspaceID})
 	eventType, title := "task.failed", "Task execution failed"
 	if lease.Task.TaskType == "proxy.health_check" {
 		eventType, title = "proxy.health_failed", "Proxy health check failed"
