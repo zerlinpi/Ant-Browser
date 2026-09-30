@@ -28,8 +28,17 @@ func (r *scheduleRepo) UpdateSchedule(_ context.Context, item Schedule, _ int64,
 	return item, nil
 }
 func (r *scheduleRepo) DeleteSchedule(context.Context, string, string) error { return nil }
-func (r *scheduleRepo) SetScheduleEnabled(_ context.Context, _ string, _ string, enabled bool, _ time.Time) (Schedule, error) {
+func (r *scheduleRepo) SetScheduleEnabled(_ context.Context, _ string, _ string, enabled bool, next *time.Time, expected int64, _ time.Time) (Schedule, error) {
+	if expected != r.item.Version {
+		return Schedule{}, ErrVersionConflict
+	}
 	r.item.Enabled = enabled
+	r.item.Status = "paused"
+	if enabled {
+		r.item.Status = "active"
+	}
+	r.item.NextRunAt = next
+	r.item.Version++
 	return r.item, nil
 }
 

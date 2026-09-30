@@ -62,7 +62,30 @@ type Repository interface {
 	RotateRefreshToken(context.Context, string, RefreshToken) (Session, User, error)
 	RevokeSession(context.Context, string, string, string) error
 	SessionActive(context.Context, string, string) (bool, error)
+	// ListActiveSessions returns up to limit of the user's sessions that are
+	// neither revoked nor expired at now, most recently active first.
+	ListActiveSessions(ctx context.Context, userID string, now time.Time, limit int) ([]Session, error)
+	// RevokeOtherSessions revokes every active session of the user except
+	// keepSessionID, with their refresh tokens, and returns their IDs.
+	RevokeOtherSessions(ctx context.Context, userID, keepSessionID, reason string, now time.Time) ([]string, error)
 }
+
+// SessionSummary describes one active sign-in to the account owner.
+type SessionSummary struct {
+	ID         string    `json:"id"`
+	DeviceID   string    `json:"deviceId,omitempty"`
+	UserAgent  string    `json:"userAgent,omitempty"`
+	IPAddress  string    `json:"ipAddress,omitempty"`
+	CreatedAt  time.Time `json:"createdAt"`
+	LastSeenAt time.Time `json:"lastSeenAt"`
+	ExpiresAt  time.Time `json:"expiresAt"`
+	// Current marks the session the request was made with.
+	Current bool `json:"current"`
+}
+
+// maxListedSessions bounds the session list. Every sign-in creates a
+// session that lives for the refresh TTL, so an account can accumulate many.
+const maxListedSessions = 200
 
 type PasswordManager interface {
 	Hash(string) (string, error)
@@ -82,6 +105,10 @@ type Service struct {
 	newOpaque  OpaqueTokenFactory
 	refreshTTL time.Duration
 	now        func() time.Time
+	// mfa is the repository's MFARepository side, when it has one.
+	mfa       MFARepository
+	sealer    SecretSealer
+	mfaIssuer string
 }
 
 type SessionMetadata struct {
@@ -112,14 +139,19 @@ type TokenPair struct {
 }
 
 func New(repository Repository, passwords PasswordManager, tokens TokenManager, newOpaque OpaqueTokenFactory, refreshTTL time.Duration) *Service {
-	return &Service{
+	service := &Service{
 		repository: repository,
 		passwords:  passwords,
 		tokens:     tokens,
 		newOpaque:  newOpaque,
 		refreshTTL: refreshTTL,
 		now:        time.Now,
+		mfaIssuer:  defaultMFAIssuer,
 	}
+	if mfa, ok := repository.(MFARepository); ok {
+		service.mfa = mfa
+	}
+	return service
 }
 
 func (s *Service) Register(ctx context.Context, input RegisterInput, metadata SessionMetadata) (TokenPair, error) {
@@ -153,22 +185,39 @@ func (s *Service) Register(ctx context.Context, input RegisterInput, metadata Se
 	return s.issueSession(ctx, user, metadata)
 }
 
-func (s *Service) Login(ctx context.Context, input LoginInput, metadata SessionMetadata) (TokenPair, error) {
+// Login checks the password. Accounts with an active second factor get a
+// challenge for VerifyMFA instead of a session.
+func (s *Service) Login(ctx context.Context, input LoginInput, metadata SessionMetadata) (LoginResult, error) {
 	email, err := normalizeEmail(input.Email)
 	if err != nil {
-		return TokenPair{}, ErrInvalidCredentials
+		return LoginResult{}, ErrInvalidCredentials
 	}
 	user, err := s.repository.FindUserByEmail(ctx, email)
 	if err != nil || s.passwords.Compare(user.PasswordHash, input.Password) != nil {
-		return TokenPair{}, ErrInvalidCredentials
+		return LoginResult{}, ErrInvalidCredentials
 	}
 	if user.Status != "active" {
-		return TokenPair{}, ErrUserDisabled
+		return LoginResult{}, ErrUserDisabled
 	}
 	if strings.TrimSpace(input.DeviceID) != "" {
 		metadata.DeviceID = strings.TrimSpace(input.DeviceID)
 	}
-	return s.issueSession(ctx, user, metadata)
+	required, err := s.mfaRequired(ctx, user.ID)
+	if err != nil {
+		return LoginResult{}, err
+	}
+	if required {
+		ticket, err := s.startMFAChallenge(ctx, user.ID, metadata.DeviceID)
+		if err != nil {
+			return LoginResult{}, err
+		}
+		return LoginResult{MFARequired: true, MFAChallenge: &ticket}, nil
+	}
+	pair, err := s.issueSession(ctx, user, metadata)
+	if err != nil {
+		return LoginResult{}, err
+	}
+	return LoginResult{TokenPair: &pair}, nil
 }
 
 func (s *Service) Refresh(ctx context.Context, rawToken string) (TokenPair, error) {
@@ -220,6 +269,67 @@ func (s *Service) Logout(ctx context.Context, userID, sessionID, reason string) 
 		reason = "user_logout"
 	}
 	return s.repository.RevokeSession(ctx, userID, sessionID, reason)
+}
+
+// ListSessions returns the caller's active sessions, the current one first.
+func (s *Service) ListSessions(ctx context.Context, userID, currentSessionID string) ([]SessionSummary, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return nil, ErrInvalidCredentials
+	}
+	sessions, err := s.repository.ListActiveSessions(ctx, userID, s.now().UTC(), maxListedSessions)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]SessionSummary, 0, len(sessions))
+	for _, session := range sessions {
+		item := SessionSummary{
+			ID: session.ID, DeviceID: session.DeviceID, UserAgent: session.UserAgent, IPAddress: session.IPAddress,
+			CreatedAt: session.CreatedAt, LastSeenAt: session.LastSeenAt, ExpiresAt: session.ExpiresAt,
+			Current: session.ID == currentSessionID,
+		}
+		if item.Current {
+			items = append([]SessionSummary{item}, items...)
+			continue
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+// RevokeUserSession ends one of the caller's active sessions; ending the
+// current one is a logout. Unknown, foreign, revoked and expired sessions are
+// all ErrNotFound, so the endpoint cannot probe other users' session IDs.
+func (s *Service) RevokeUserSession(ctx context.Context, userID, currentSessionID, sessionID string) error {
+	userID, sessionID = strings.TrimSpace(userID), strings.TrimSpace(sessionID)
+	if userID == "" {
+		return ErrInvalidCredentials
+	}
+	if parsed, err := uuid.Parse(sessionID); err != nil || parsed.String() != sessionID {
+		return ErrNotFound
+	}
+	active, err := s.repository.SessionActive(ctx, userID, sessionID)
+	if err != nil {
+		return err
+	}
+	if !active {
+		return ErrNotFound
+	}
+	reason := "user_revoked"
+	if sessionID == currentSessionID {
+		reason = "user_logout"
+	}
+	return s.repository.RevokeSession(ctx, userID, sessionID, reason)
+}
+
+// RevokeOtherSessions signs the caller out everywhere except the current
+// session and returns the IDs of the sessions it ended.
+func (s *Service) RevokeOtherSessions(ctx context.Context, userID, currentSessionID string) ([]string, error) {
+	userID, currentSessionID = strings.TrimSpace(userID), strings.TrimSpace(currentSessionID)
+	if userID == "" || currentSessionID == "" {
+		return nil, ErrInvalidCredentials
+	}
+	return s.repository.RevokeOtherSessions(ctx, userID, currentSessionID, "user_revoked_others", s.now().UTC())
 }
 
 func (s *Service) User(ctx context.Context, userID string) (User, error) {

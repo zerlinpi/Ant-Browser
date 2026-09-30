@@ -1,4 +1,4 @@
-﻿package launchcode
+package launchcode
 
 import (
 	"encoding/json"

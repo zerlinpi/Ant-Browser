@@ -52,6 +52,24 @@ func isUniqueViolation(err error) bool {
 	return errors.As(err, &pgError) && pgError.Code == "23505"
 }
 
+// Case-insensitive name indexes: live rows from migration 027, and every
+// workflow, archived included, from migration 031. A violation of one of them
+// is a user-facing name conflict; any other unique violation is not.
+const (
+	instanceNameIndex      = "browser_instances_live_name_uq"
+	proxyNameIndex         = "proxies_live_name_uq"
+	accountIdentifierIndex = "accounts_live_identifier_uq"
+	profileNameIndex       = "browser_profiles_live_name_uq"
+	workflowNameIndex      = "workflows_lower_name_uq"
+)
+
+// isUniqueViolationOn reports a unique violation of the named constraint or
+// unique index (PostgreSQL reports the index name for index violations).
+func isUniqueViolationOn(err error, name string) bool {
+	var pgError *pgconn.PgError
+	return errors.As(err, &pgError) && pgError.Code == "23505" && pgError.ConstraintName == name
+}
+
 func isForeignKeyViolation(err error) bool {
 	var pgError *pgconn.PgError
 	return errors.As(err, &pgError) && pgError.Code == "23503"

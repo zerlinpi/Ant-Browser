@@ -23,6 +23,10 @@ var (
 	ErrNotFound        = errors.New("workflow not found")
 	ErrVersionConflict = errors.New("workflow version conflict")
 	ErrStateConflict   = errors.New("workflow state conflict")
+	// ErrNameConflict: workflow names are unique per workspace, compared
+	// case-insensitively, archived workflows included (archiving keeps the
+	// workflow and its history).
+	ErrNameConflict = errors.New("workflow name already exists")
 )
 
 const (

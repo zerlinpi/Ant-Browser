@@ -42,6 +42,9 @@ import (
 
 type repositoryStore interface {
 	authservice.Repository
+	// Listed so both stores must keep implementing second factors; the auth
+	// service detects the capability on the repository it is given.
+	authservice.MFARepository
 	workspaceservice.Repository
 	deviceservice.Repository
 	browserinstanceservice.Repository
@@ -137,6 +140,11 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	mfaSealer, err := secureenvelope.NewTextSealer(envelopeCrypto)
+	if err != nil {
+		return err
+	}
+	auth.ConfigureMFA(mfaSealer, "Ant Browser")
 	proxySecrets, err := secureenvelope.NewProxyProvider(store, envelopeCrypto)
 	if err != nil {
 		return err
@@ -153,7 +161,8 @@ func run(logger *slog.Logger) error {
 	handler := gatewayservice.NewWithInfrastructure(
 		rootContext, auth, workspaces, devices, instances, tokens,
 		dependencies, realtimeBus, tasks, taskWake, fingerprints, profiles, workflows, accounts, proxies, logger, notifications, schedules, analytics, admin,
-		batches, billing,
+		batches, billing, gatewayservice.AllowedOrigins(cfg.AllowedOrigins),
+		gatewayservice.TrustedProxies(cfg.TrustedProxyCIDRs),
 	)
 
 	server := &http.Server{

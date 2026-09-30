@@ -14,6 +14,7 @@ import (
 )
 
 // Vue assets are built by desktop/vue3-ui directly into this directory.
+//
 //go:embed all:frontend/dist
 var assets embed.FS
 

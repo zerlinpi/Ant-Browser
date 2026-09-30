@@ -36,6 +36,11 @@ func TestMigrationCompletionRejectsRevokedOrSupersededTarget(t *testing.T) {
 				if err != nil || store.instances[instance.ID].AssignedDeviceID != device.ID || store.commands[command.ID].Status != "completed" {
 					t.Fatalf("valid completion failed: %v", err)
 				}
+				pending, pendingErr := store.ListPendingCommands(context.Background(), "workspace", device.ID)
+				if pendingErr != nil || len(pending) != 1 || pending[0].Action != "instance.start" ||
+					pending[0].IdempotencyKey != instances.MigrationStartIdempotencyKey(command.ID) || pending[0].ExpectedVersion != 3 {
+					t.Fatalf("migration follow-up=%+v err=%v", pending, pendingErr)
+				}
 			} else {
 				if !errors.Is(err, instances.ErrStateConflict) {
 					t.Fatalf("unsafe completion: %v", err)

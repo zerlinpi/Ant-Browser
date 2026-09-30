@@ -84,6 +84,10 @@ func (a *App) emitBrowserInstanceUpdated(profile *BrowserProfile) {
 	runtime.EventsEmit(a.ctx, "browser:instance:updated", browserInstanceEventPayload(profile, false))
 }
 
+// markProfileRunningLocked records that profile is backed by a live browser.
+// A nil cmd means the process was discovered (user-data directory or DevTools
+// port) rather than launched by this app, so any launch provenance is cleared:
+// the discovered process is not the one those arguments describe.
 func (a *App) markProfileRunningLocked(profileId string, profile *BrowserProfile, cmd *exec.Cmd, pid int, debugPort int, debugReady bool, runtimeWarning string) {
 	if profile == nil {
 		return
@@ -97,17 +101,37 @@ func (a *App) markProfileRunningLocked(profileId string, profile *BrowserProfile
 	profile.LastError = ""
 	if cmd != nil {
 		a.browserMgr.BrowserProcesses[profileId] = cmd
+	} else {
+		clearProfileLaunchProvenanceLocked(profile)
 	}
 	if debugReady && a.launchServer != nil {
 		a.launchServer.SetActiveProfile(profile)
 	}
 }
 
+// markProfileLastLaunchArgsLocked records the launch provenance of the
+// Chromium process this app started and is still tracking for profile.
+// LastLaunchArgs must describe only that process: callers record it after the
+// process is running and tracked, and every stop, crash, failed start or
+// adoption clears it. An empty args slice clears the provenance.
 func (a *App) markProfileLastLaunchArgsLocked(profile *BrowserProfile, args []string) {
 	if profile == nil {
 		return
 	}
+	if len(args) == 0 {
+		clearProfileLaunchProvenanceLocked(profile)
+		return
+	}
 	profile.LastLaunchArgs = append([]string{}, args...)
+}
+
+// clearProfileLaunchProvenanceLocked forgets the launch arguments of a process
+// that this app no longer tracks (stopped, crashed, gone or never started).
+func clearProfileLaunchProvenanceLocked(profile *BrowserProfile) {
+	if profile == nil {
+		return
+	}
+	profile.LastLaunchArgs = nil
 }
 
 func (a *App) markProfileDebugReadyLocked(profile *BrowserProfile, debugPort int) {

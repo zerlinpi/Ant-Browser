@@ -94,6 +94,27 @@ func (g *Gateway) assignProxy(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusCreated, map[string]interface{}{"data": item})
 }
 
+func (g *Gateway) listProxyAssignments(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	items, err := g.proxies.ListAssignments(r.Context(), mustPrincipal(r.Context()).UserID, r.PathValue("workspaceID"), proxyservice.AssignmentFilter{
+		ProxyID: query.Get("proxyId"), TargetType: query.Get("targetType"),
+	})
+	if err != nil {
+		g.writeServiceError(w, r, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]interface{}{"data": items})
+}
+
+func (g *Gateway) getProxyAssignment(w http.ResponseWriter, r *http.Request) {
+	item, err := g.proxies.GetAssignment(r.Context(), mustPrincipal(r.Context()).UserID, r.PathValue("workspaceID"), r.PathValue("targetType"), r.PathValue("targetID"))
+	if err != nil {
+		g.writeServiceError(w, r, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]interface{}{"data": item})
+}
+
 func (g *Gateway) unassignProxy(w http.ResponseWriter, r *http.Request) {
 	version, err := versionPrecondition(r)
 	if err != nil {

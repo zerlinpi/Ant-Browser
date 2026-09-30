@@ -1,6 +1,9 @@
 package browserinstanceservice
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestCommandMatchesCanonicalPayload(t *testing.T) {
 	command := Command{InstanceID: "instance", Action: "instance.migrate", ExpectedVersion: 4, Payload: map[string]interface{}{"targetDeviceId": "device-a", "options": map[string]interface{}{"a": 1, "b": 2}}}
@@ -31,6 +34,25 @@ func TestPendingStartAndMigrationFenceRuntimeEdits(t *testing.T) {
 		instance := BrowserInstance{DesiredState: state, ObservedState: "offline"}
 		if !instance.isRuntimeActive() {
 			t.Fatalf("pending %s permits runtime reconfiguration", state)
+		}
+	}
+}
+
+func TestCommandDeadlineCoversProfileSynchronization(t *testing.T) {
+	for _, test := range []struct {
+		action, profileID string
+		want              time.Duration
+	}{
+		{"instance.start", "", lifecycleCommandTimeout},
+		{"instance.stop", "", lifecycleCommandTimeout},
+		{"instance.restart", "  ", lifecycleCommandTimeout},
+		{"instance.start", "profile", profileSyncCommandTimeout},
+		{"instance.stop", "profile", profileSyncCommandTimeout},
+		{"instance.restart", "profile", profileSyncCommandTimeout},
+		{"instance.migrate", "profile", profileSyncCommandTimeout},
+	} {
+		if got := commandDeadline(test.action, test.profileID); got != test.want {
+			t.Errorf("commandDeadline(%q, %q) = %s, want %s", test.action, test.profileID, got, test.want)
 		}
 	}
 }

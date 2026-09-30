@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,14 +50,57 @@ type commandFrame struct {
 	Payload       json.RawMessage `json:"payload"`
 }
 
-type commandProtocolError struct{}
+// Terminal conditions reported by Run. Use errors.Is to classify them.
+var (
+	// ErrDeviceRejected means the control plane refused the device credential
+	// during the WebSocket handshake (HTTP 401 or 403), for example after the
+	// device was revoked or its credential rotated. Retrying with the same
+	// credential cannot succeed.
+	ErrDeviceRejected = errors.New("cloud rejected the device credential")
+	// ErrProtocolMismatch means the control plane refused the protocol
+	// upgrade (HTTP 426), negotiated another subprotocol, or announced a
+	// different device or workspace identity than this agent is configured for.
+	ErrProtocolMismatch = errors.New("cloud command protocol or identity mismatch")
+	// ErrJournalUnavailable means the durable command journal could not be
+	// read or written, so no command can be executed safely.
+	ErrJournalUnavailable = errors.New("local command journal is unavailable")
+)
 
-func (commandProtocolError) Error() string { return "cloud command protocol or identity rejected" }
+// Failure codes reported for dispatches that are never executed.
+const (
+	failureInvalidCommand     = "invalid_command"
+	failureUnsupportedCommand = "unsupported_command"
+	failureCommandConflict    = "command_conflict"
+	maxFailureMessageRunes    = 300
+	// maxCommandExecution bounds any single command even when the control
+	// plane grants a longer deadline. Profile synchronisation during start,
+	// stop, restart and migration can legitimately take tens of minutes.
+	maxCommandExecution = 35 * time.Minute
+)
+
+type commandProtocolError struct{ cause error }
+
+func (e commandProtocolError) Error() string {
+	if e.cause == nil {
+		return ErrProtocolMismatch.Error()
+	}
+	return e.cause.Error()
+}
+
+func (e commandProtocolError) Unwrap() error {
+	if e.cause == nil {
+		return ErrProtocolMismatch
+	}
+	return e.cause
+}
 
 type commandLocalFatalError struct{ cause error }
 
 func (e commandLocalFatalError) Error() string { return "local command safety state is unavailable" }
 func (e commandLocalFatalError) Unwrap() error { return e.cause }
+
+// Is lets callers classify every local fatal condition as ErrJournalUnavailable.
+func (e commandLocalFatalError) Is(target error) bool { return target == ErrJournalUnavailable }
 
 func NewCommandClient(config Config, executor CommandExecutor, journal *CommandJournal) (*CommandClient, error) {
 	config, err := validateConnectionConfig(config)
@@ -72,8 +116,19 @@ func NewCommandClient(config Config, executor CommandExecutor, journal *CommandJ
 	return &CommandClient{config: config, executor: executor, journal: journal, dialer: &dialer}, nil
 }
 
-// Run reconnects transport failures, but not rejected authentication or tenant
-// identity. A journal prevents re-execution across sessions and app restarts.
+// Run consumes cloud commands until ctx ends. Transport failures reconnect
+// with backoff internally, and a single malformed, foreign or conflicting
+// dispatch is reported (or ignored) without ending the session. Run returns
+// only when ctx is done or on a terminal condition:
+//
+//   - ErrDeviceRejected: the credential was refused; the host should stop
+//     and wait for a new credential instead of retrying.
+//   - ErrProtocolMismatch: the control plane is incompatible or announced a
+//     different identity; the host may retry later with a long backoff.
+//   - ErrJournalUnavailable: the durable journal failed; commands cannot be
+//     executed safely until the host reopens a healthy journal.
+//
+// A journal prevents re-execution across sessions and app restarts.
 func (c *CommandClient) Run(ctx context.Context) error {
 	if !c.running.CompareAndSwap(false, true) {
 		return errors.New("command client is already running")
@@ -171,14 +226,19 @@ func (c *CommandClient) runSession(parent context.Context) error {
 	endpoint := "wss" + strings.TrimPrefix(c.config.BaseURL, "https") + "/api/v1/agent/ws"
 	conn, response, err := c.dialer.DialContext(ctx, endpoint, headers)
 	if err != nil {
-		if response != nil && (response.StatusCode == 401 || response.StatusCode == 403 || response.StatusCode == 426) {
-			return commandProtocolError{}
+		if response != nil {
+			switch response.StatusCode {
+			case http.StatusUnauthorized, http.StatusForbidden:
+				return commandProtocolError{cause: ErrDeviceRejected}
+			case http.StatusUpgradeRequired:
+				return commandProtocolError{cause: ErrProtocolMismatch}
+			}
 		}
 		return errors.New("cloud command connection failed")
 	}
 	defer conn.Close()
 	if conn.Subprotocol() != commandProtocol {
-		return commandProtocolError{}
+		return commandProtocolError{cause: ErrProtocolMismatch}
 	}
 	conn.SetReadLimit(1 << 20)
 	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -193,7 +253,7 @@ func (c *CommandClient) runSession(parent context.Context) error {
 		HeartbeatIntervalSeconds int    `json:"heartbeatIntervalSeconds"`
 	}
 	if hello.Type != "server.hello" || json.Unmarshal(hello.Payload, &identity) != nil || identity.DeviceID != c.config.DeviceID || identity.WorkspaceID != c.config.WorkspaceID || identity.Protocol != commandProtocol {
-		return commandProtocolError{}
+		return commandProtocolError{cause: ErrProtocolMismatch}
 	}
 	s := &commandSession{conn: conn, frames: make(chan commandFrame, 128), ctx: ctx}
 	readerDone := make(chan struct{})
@@ -215,7 +275,7 @@ func (c *CommandClient) runSession(parent context.Context) error {
 	}()
 	go func() { <-ctx.Done(); _ = conn.Close() }()
 	defer func() { cancel(); _ = conn.Close(); <-readerDone }()
-	if err := s.report("agent.hello", map[string]any{"agentVersion": c.config.AgentVersion, "capabilities": map[string]any{"instanceCommands": true, "instanceActions": []string{"start", "stop", "restart"}, "durableCommandJournal": true}}); err != nil {
+	if err := s.report("agent.hello", map[string]any{"agentVersion": c.config.AgentVersion, "capabilities": map[string]any{"instanceCommands": true, "instanceActions": []string{"start", "stop", "restart", "migrate"}, "durableCommandJournal": true}}); err != nil {
 		return err
 	}
 	heartbeatInterval := time.Duration(identity.HeartbeatIntervalSeconds) * time.Second
@@ -257,13 +317,22 @@ func (c *CommandClient) runSession(parent context.Context) error {
 			continue
 		}
 		var command InstanceCommand
-		if json.Unmarshal(frame.Payload, &command) != nil || !c.validCommand(command) {
-			return commandProtocolError{}
-		}
-		if handled[command.ID] {
+		decodeErr := json.Unmarshal(frame.Payload, &command)
+		disposition, failureCode := c.classifyCommand(command, decodeErr)
+		if disposition == commandIgnored || handled[command.ID] {
 			continue
 		}
-		if err := c.execute(ctx, s, command); err != nil {
+		if disposition == commandRejected {
+			// The command belongs to this device but can never run here;
+			// report it so the control plane does not wait for a deadline.
+			message := "command was rejected by the agent before execution"
+			if failureCode == failureUnsupportedCommand {
+				message = "command action is not supported by this agent"
+			}
+			if err := s.report("command.failed", failurePayload(command.ID, failureCode, message)); err != nil {
+				return err
+			}
+		} else if err := c.execute(ctx, s, command); err != nil {
 			return err
 		}
 		handled[command.ID] = true
@@ -273,27 +342,85 @@ func (c *CommandClient) runSession(parent context.Context) error {
 	}
 }
 
-func (c *CommandClient) validCommand(command InstanceCommand) bool {
-	if command.WorkspaceID != c.config.WorkspaceID || command.DeviceID != c.config.DeviceID || command.ExpectedVersion < 1 || command.Deadline.IsZero() {
-		return false
+type commandDisposition int
+
+const (
+	commandAccepted commandDisposition = iota
+	// commandIgnored frames are dropped silently: they cannot be attributed
+	// to this device (undecodable, non-canonical ID, another device or
+	// workspace) or are already terminal on the control plane.
+	commandIgnored
+	// commandRejected frames are addressed to this device but are malformed
+	// or unsupported; they are reported as failed and never executed.
+	commandRejected
+)
+
+func (c *CommandClient) classifyCommand(command InstanceCommand, decodeErr error) (commandDisposition, string) {
+	if decodeErr != nil || !canonicalUUID(command.ID) {
+		return commandIgnored, ""
 	}
-	for _, id := range []string{command.ID, command.InstanceID} {
-		parsed, err := uuid.Parse(id)
-		if err != nil || parsed.String() != id {
-			return false
-		}
+	if command.WorkspaceID != c.config.WorkspaceID || command.DeviceID != c.config.DeviceID {
+		// Never execute or answer for another device's command.
+		return commandIgnored, ""
 	}
 	switch command.Status {
 	case "pending", "queued", "accepted", "running":
+	case "completed", "failed", "cancelled", "expired":
+		return commandIgnored, ""
 	default:
-		return false
+		return commandRejected, failureInvalidCommand
+	}
+	if !canonicalUUID(command.InstanceID) || command.ExpectedVersion < 1 || command.Deadline.IsZero() {
+		return commandRejected, failureInvalidCommand
 	}
 	switch command.Action {
 	case "instance.start", "instance.stop", "instance.restart", "instance.migrate":
-		return true
+		return commandAccepted, ""
 	default:
-		return false
+		return commandRejected, failureUnsupportedCommand
 	}
+}
+
+func canonicalUUID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed.String() == value
+}
+
+func failurePayload(commandID, code, message string) map[string]any {
+	payload := map[string]any{"commandId": commandID, "failureCode": code}
+	if message = sanitizeFailureMessage(message); message != "" {
+		payload["failureMessage"] = message
+	}
+	return payload
+}
+
+var (
+	windowsPathPattern = regexp.MustCompile(`(?i)(?:\\\\\?\\)?[a-z]:\\[^\s"'<>|:]*`)
+	uncPathPattern     = regexp.MustCompile(`\\\\[^\s"'<>|:\\]+\\[^\s"'<>|:]*`)
+	unixPathPattern    = regexp.MustCompile(`(^|[\s"'(=])(/[^\s"'<>|:/]+){2,}/?`)
+	urlQueryPattern    = regexp.MustCompile(`(https?://[^\s"'?#]+)[?#][^\s"']*`)
+)
+
+// sanitizeFailureMessage turns a local error into a single-line diagnostic
+// for the control plane. Local filesystem paths (which reveal user names and
+// directory layout) are redacted and the result is bounded.
+func sanitizeFailureMessage(message string) string {
+	message = strings.Map(func(r rune) rune {
+		if r == '\r' || r == '\n' || r == '\t' || (r < 0x20 && r != ' ') || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, message)
+	// Presigned object URLs carry signatures in the query string.
+	message = urlQueryPattern.ReplaceAllString(message, "$1?<redacted>")
+	message = windowsPathPattern.ReplaceAllString(message, "<path>")
+	message = uncPathPattern.ReplaceAllString(message, "<path>")
+	message = unixPathPattern.ReplaceAllString(message, "$1<path>")
+	message = strings.Join(strings.Fields(message), " ")
+	if runes := []rune(message); len(runes) > maxFailureMessageRunes {
+		message = string(runes[:maxFailureMessageRunes-1]) + "…"
+	}
+	return message
 }
 
 func (c *CommandClient) execute(ctx context.Context, s *commandSession, command InstanceCommand) error {
@@ -301,7 +428,7 @@ func (c *CommandClient) execute(ctx context.Context, s *commandSession, command 
 	var payload any
 	if len(command.Payload) > 0 {
 		if err := json.Unmarshal(command.Payload, &payload); err != nil {
-			return commandProtocolError{}
+			return s.report("command.failed", failurePayload(command.ID, failureInvalidCommand, "command payload is not valid JSON"))
 		}
 	}
 	canonical, _ := json.Marshal(payload)
@@ -312,11 +439,19 @@ func (c *CommandClient) execute(ctx context.Context, s *commandSession, command 
 	digest := sha256.Sum256(encoded)
 	receipt, exists, err := c.journal.begin(command.ID, hex.EncodeToString(digest[:]))
 	if err != nil {
+		if exists && errors.Is(err, errJournalRecordConflict) {
+			// The ID was already journaled with different content, or its
+			// record is unreadable. Either way the dispatch must not run and
+			// the existing record is kept as evidence.
+			return s.report("command.failed", failurePayload(command.ID, failureCommandConflict, "command identifier was reused with different content"))
+		}
 		return commandLocalFatalError{cause: err}
 	}
+	failureMessage := ""
 	if exists && receipt.Status == "started" {
 		receipt.Status = "failed"
 		receipt.FailureCode = "execution_uncertain"
+		failureMessage = "a previous execution attempt was interrupted; the outcome is uncertain"
 		if err := c.journal.finish(receipt); err != nil {
 			return commandLocalFatalError{cause: err}
 		}
@@ -327,21 +462,26 @@ func (c *CommandClient) execute(ctx context.Context, s *commandSession, command 
 			if err := c.journal.finish(receipt); err != nil {
 				return commandLocalFatalError{cause: err}
 			}
-			return s.report("command.failed", map[string]any{"commandId": command.ID, "failureCode": receipt.FailureCode})
+			return s.report("command.failed", failurePayload(command.ID, receipt.FailureCode, "command was already in progress without a local journal record; the outcome is uncertain"))
 		}
 		if !command.Deadline.After(time.Now()) {
 			receipt.Status = "failed"
 			receipt.FailureCode = "command_expired"
+			failureMessage = "command deadline passed before execution started"
 		} else {
 			if err := s.report("command.running", map[string]any{"commandId": command.ID}); err != nil {
 				return err
 			}
+			// The control plane's deadline is authoritative (profile sync can
+			// legitimately take many minutes); it is only bounded locally so a
+			// skewed or hostile deadline cannot pin the executor indefinitely.
 			deadline := command.Deadline
-			if maximum := time.Now().Add(2 * time.Minute); deadline.After(maximum) {
+			if maximum := time.Now().Add(maxCommandExecution); deadline.After(maximum) {
 				deadline = maximum
 			}
 			executionCtx, cancel := context.WithDeadline(ctx, deadline)
 			state, executionErr := c.executor.ExecuteCommand(executionCtx, command)
+			deadlineExceeded := errors.Is(executionCtx.Err(), context.DeadlineExceeded)
 			cancel()
 			receipt.Status = "completed"
 			if state != "" && state != "running" && state != "offline" {
@@ -353,6 +493,14 @@ func (c *CommandClient) execute(ctx context.Context, s *commandSession, command 
 			if executionErr != nil || receipt.ObservedState == "" {
 				receipt.Status = "failed"
 				receipt.FailureCode = "local_execution_failed"
+				switch {
+				case deadlineExceeded:
+					failureMessage = "command deadline exceeded during local execution"
+				case executionErr != nil:
+					failureMessage = executionErr.Error()
+				default:
+					failureMessage = "local executor did not report an instance state"
+				}
 			}
 		}
 		if err := c.journal.finish(receipt); err != nil {
@@ -363,6 +511,11 @@ func (c *CommandClient) execute(ctx context.Context, s *commandSession, command 
 		if err := s.report("instance.observed", map[string]any{"instanceId": command.InstanceID, "state": receipt.ObservedState}); err != nil {
 			return err
 		}
+	}
+	if receipt.Status == "failed" {
+		// The message is diagnostic only and is not persisted in the journal,
+		// so a replayed report carries the stable failure code alone.
+		return s.report("command.failed", failurePayload(command.ID, receipt.FailureCode, failureMessage))
 	}
 	return s.report("command."+receipt.Status, map[string]any{"commandId": command.ID, "failureCode": receipt.FailureCode})
 }

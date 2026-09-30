@@ -23,7 +23,7 @@ func scanSchedule(row scanner) (scheduleservice.Schedule, error) {
 	return v, err
 }
 func (s *Store) CreateSchedule(ctx context.Context, v scheduleservice.Schedule) (scheduleservice.Schedule, error) {
-	return scanSchedule(s.pool.QueryRow(ctx, `INSERT INTO schedules (id,workspace_id,workflow_id,workflow_version_id,instance_id,cron_expression,timezone,enabled,status,next_run_at,last_error,version,created_at,updated_at) VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING `+scheduleColumns, v.ID, v.WorkspaceID, v.WorkflowID, v.WorkflowVersionID, v.InstanceID, v.CronExpression, v.Timezone, v.Enabled, v.Status, v.NextRunAt, v.LastError, v.Version, v.CreatedAt, v.UpdatedAt))
+	return scanSchedule(s.pool.QueryRow(ctx, `INSERT INTO schedules AS s (id,workspace_id,workflow_id,workflow_version_id,instance_id,cron_expression,timezone,enabled,status,next_run_at,last_error,version,created_at,updated_at) VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING `+scheduleColumns, v.ID, v.WorkspaceID, v.WorkflowID, v.WorkflowVersionID, v.InstanceID, v.CronExpression, v.Timezone, v.Enabled, v.Status, v.NextRunAt, v.LastError, v.Version, v.CreatedAt, v.UpdatedAt))
 }
 func (s *Store) FindSchedule(ctx context.Context, w, id string) (scheduleservice.Schedule, error) {
 	return scanSchedule(s.pool.QueryRow(ctx, `SELECT `+scheduleColumns+` FROM schedules s WHERE s.workspace_id=$1::uuid AND s.id=$2::uuid`, w, id))
@@ -60,12 +60,18 @@ func (s *Store) DeleteSchedule(ctx context.Context, w, id string) error {
 	}
 	return err
 }
-func (s *Store) SetScheduleEnabled(ctx context.Context, w, id string, enabled bool, now time.Time) (scheduleservice.Schedule, error) {
+func (s *Store) SetScheduleEnabled(ctx context.Context, w, id string, enabled bool, nextRunAt *time.Time, expectedVersion int64, now time.Time) (scheduleservice.Schedule, error) {
 	status := "paused"
 	if enabled {
 		status = "active"
 	}
-	return scanSchedule(s.pool.QueryRow(ctx, `UPDATE schedules s SET enabled=$3,status=$4,updated_at=$5,version=s.version+1 WHERE s.workspace_id=$1::uuid AND s.id=$2::uuid RETURNING `+scheduleColumns, w, id, enabled, status, now))
+	updated, err := scanSchedule(s.pool.QueryRow(ctx, `UPDATE schedules s SET enabled=$3,status=$4,next_run_at=$5,updated_at=$6,version=s.version+1 WHERE s.workspace_id=$1::uuid AND s.id=$2::uuid AND s.version=$7 RETURNING `+scheduleColumns, w, id, enabled, status, nextRunAt, now, expectedVersion))
+	if errors.Is(err, scheduleservice.ErrNotFound) {
+		if _, findErr := s.FindSchedule(ctx, w, id); findErr == nil {
+			return scheduleservice.Schedule{}, scheduleservice.ErrVersionConflict
+		}
+	}
+	return updated, err
 }
 
 func (s *Store) ClaimDueSchedules(ctx context.Context, worker string, now time.Time, limit int) ([]scheduleservice.Dispatch, error) {
@@ -120,23 +126,20 @@ func (s *Store) ClaimDueSchedules(ctx context.Context, worker string, now time.T
 			}
 			continue
 		}
-		var executableID string
-		err = tx.QueryRow(ctx, `SELECT w.id::text
-			FROM workflows w
-			JOIN workflow_versions v ON v.workspace_id=w.workspace_id AND v.workflow_id=w.id AND v.id=$3::uuid
-			JOIN browser_instances i ON i.workspace_id=w.workspace_id AND i.id=$4::uuid AND i.deleted_at IS NULL
-			WHERE w.workspace_id=$1::uuid AND w.id=$2::uuid AND w.status='published'
-			  AND w.published_version_id=v.id
-			  AND v.definition->>'engine' IN ('playwright','cdp')
-			FOR SHARE OF w,v,i`, item.WorkspaceID, item.WorkflowID, item.WorkflowVersionID, item.InstanceID).Scan(&executableID)
-		if errors.Is(err, pgx.ErrNoRows) {
+		// schedule_target_executable (migration 028) checks the pinned
+		// workflow version and instance and locks them FOR SHARE until the
+		// transaction ends, so publication, archiving or deletion cannot race
+		// the enqueue. ant_worker itself has no UPDATE privilege to lock them.
+		var executable bool
+		if err := tx.QueryRow(ctx, `SELECT schedule_target_executable($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid)`,
+			item.WorkspaceID, item.ID, item.WorkflowID, item.WorkflowVersionID, item.InstanceID).Scan(&executable); err != nil {
+			return nil, err
+		}
+		if !executable {
 			if _, updateErr := tx.Exec(ctx, `UPDATE schedules SET status='error',last_error='workflow target is no longer executable',updated_at=$3,lease_owner='',lease_expires_at=NULL,version=version+1 WHERE workspace_id=$1::uuid AND id=$2::uuid`, item.WorkspaceID, item.ID, now); updateErr != nil {
 				return nil, updateErr
 			}
 			continue
-		}
-		if err != nil {
-			return nil, err
 		}
 		taskID := uuid.NewString()
 		key := "schedule:" + item.ID + ":" + scheduled.Format(time.RFC3339)

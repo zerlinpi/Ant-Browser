@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zerlinpi/Ant-Browser/server/platform/postgres"
+	notificationservice "github.com/zerlinpi/Ant-Browser/server/services/notification-service"
 	taskservice "github.com/zerlinpi/Ant-Browser/server/services/task-service"
 )
 
@@ -22,6 +23,13 @@ type Queue interface {
 }
 
 type Handler func(context.Context, taskservice.Task) (map[string]interface{}, error)
+
+// NotificationPublisher is an internal producer boundary. Task workers never
+// expose notification creation to clients and publish only server-owned,
+// non-secret diagnostics after a terminal failure.
+type NotificationPublisher interface {
+	Publish(context.Context, notificationservice.CreateInput) (notificationservice.Notification, error)
+}
 
 type Failure struct {
 	Code       string
@@ -38,14 +46,15 @@ func (f Failure) Error() string {
 }
 
 type Worker struct {
-	queue        Queue
-	workerID     string
-	handlers     map[string]Handler
-	supported    []string
-	leaseTTL     time.Duration
-	pollInterval time.Duration
-	parallelism  int
-	logger       *slog.Logger
+	queue         Queue
+	workerID      string
+	handlers      map[string]Handler
+	supported     []string
+	leaseTTL      time.Duration
+	pollInterval  time.Duration
+	parallelism   int
+	logger        *slog.Logger
+	notifications NotificationPublisher
 }
 
 func New(
@@ -55,6 +64,7 @@ func New(
 	leaseTTL, pollInterval time.Duration,
 	parallelism int,
 	logger *slog.Logger,
+	publishers ...NotificationPublisher,
 ) (*Worker, error) {
 	if queue == nil || workerID == "" || len(handlers) == 0 || leaseTTL <= 0 || pollInterval <= 0 || parallelism <= 0 || logger == nil {
 		return nil, errors.New("task worker configuration is invalid")
@@ -67,10 +77,14 @@ func New(
 		supported = append(supported, taskType)
 	}
 	sort.Strings(supported)
-	return &Worker{
+	worker := &Worker{
 		queue: queue, workerID: workerID, handlers: handlers, supported: supported,
 		leaseTTL: leaseTTL, pollInterval: pollInterval, parallelism: parallelism, logger: logger,
-	}, nil
+	}
+	if len(publishers) > 0 {
+		worker.notifications = publishers[0]
+	}
+	return worker, nil
 }
 
 func (w *Worker) Run(ctx context.Context, wakeups <-chan struct{}) error {
@@ -150,7 +164,36 @@ func (w *Worker) process(ctx context.Context, lease taskservice.Lease, slot int)
 		logger.ErrorContext(ctx, "task_fail_transition_failed", "error", failErr, "execution_error", err)
 		return
 	}
+	if !failure.Retryable || lease.Attempt > lease.Task.RetryLimit {
+		w.publishTerminalFailure(ctx, lease, failure, logger)
+	}
 	logger.WarnContext(ctx, "task_failed", "code", failure.Code, "retryable", failure.Retryable, "error", err)
+}
+
+func (w *Worker) publishTerminalFailure(ctx context.Context, lease taskservice.Lease, failure Failure, logger *slog.Logger) {
+	if w.notifications == nil || lease.Task.RequestedBy == "" {
+		return
+	}
+	// Notifications are workspace rows: publish under the task's workspace
+	// scope, like the handler, or the tenant policies reject the insert.
+	ctx = postgres.WithTenantScope(ctx, postgres.TenantScope{WorkspaceID: lease.Task.WorkspaceID})
+	eventType, title := "task.failed", "Task execution failed"
+	if lease.Task.TaskType == "proxy.health_check" {
+		eventType, title = "proxy.health_failed", "Proxy health check failed"
+	}
+	_, err := w.notifications.Publish(ctx, notificationservice.CreateInput{
+		WorkspaceID: lease.Task.WorkspaceID, RecipientUserID: lease.Task.RequestedBy,
+		EventType: eventType, Title: title,
+		Body: "The task reached a terminal failure. Review the task center for details.",
+		Payload: map[string]interface{}{
+			"taskId": lease.Task.ID, "taskType": lease.Task.TaskType,
+			"attempt": lease.Attempt, "errorCode": failure.Code,
+		},
+		IdempotencyKey: fmt.Sprintf("task-failure:%s:%d", lease.Task.ID, lease.Attempt),
+	})
+	if err != nil {
+		logger.ErrorContext(ctx, "task_failure_notification_failed", "error", err)
+	}
 }
 
 func executeSafely(ctx context.Context, handler Handler, task taskservice.Task) (result map[string]interface{}, err error) {

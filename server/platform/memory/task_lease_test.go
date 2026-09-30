@@ -68,42 +68,42 @@ func TestCancelTaskClosesCurrentRunAndAttempt(t *testing.T) {
 			s := New()
 			now := time.Now().UTC()
 			s.tasks["task"] = tasks.Task{ID: "task", WorkspaceID: "workspace", TaskType: "system.healthcheck", Status: "queued", AvailableAt: now, RetryLimit: 0}
-		lease, err := s.ClaimNextTask(ctx, "worker", []string{"system.healthcheck"}, time.Minute, now)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if start {
-			if err := s.StartTask(ctx, lease, now); err != nil {
+			lease, err := s.ClaimNextTask(ctx, "worker", []string{"system.healthcheck"}, time.Minute, now)
+			if err != nil {
 				t.Fatal(err)
 			}
-		}
-		cancelled, err := s.CancelTask(ctx, "workspace", "task", now.Add(time.Second))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if cancelled.Status != "cancelled" {
-			t.Fatalf("task status = %q", cancelled.Status)
-		}
-		if _, ok := s.taskLeases[lease.Task.ID]; ok {
-			t.Fatal("task lease was not removed")
-		}
-		run := s.taskRuns[lease.RunID]
-		if run.status != "cancelled" || run.errorCode != "task_cancelled" || run.finishedAt == nil {
-			t.Fatalf("run was not closed: %+v", run)
-		}
-		attempt := s.taskAttemptStates[lease.AttemptID]
-		if attempt.status != "expired" || attempt.errorCode != "task_cancelled" || attempt.finishedAt == nil {
-			t.Fatalf("attempt was not closed: %+v", attempt)
-		}
-		if start && run.status != "cancelled" {
-			t.Fatalf("running task run was not cancelled: %+v", run)
-		}
-		if !start && run.status != "cancelled" {
-			t.Fatalf("leased task run was not cancelled: %+v", run)
-		}
-		if _, err := s.ClaimNextTask(ctx, "worker-2", []string{"system.healthcheck"}, time.Minute, now.Add(2*time.Second)); !errors.Is(err, tasks.ErrNoWork) {
-			t.Fatalf("cancelled task was claimable: %v", err)
-		}
-	})
+			if start {
+				if err := s.StartTask(ctx, lease, now); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cancelled, err := s.CancelTask(ctx, "workspace", "task", now.Add(time.Second))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cancelled.Status != "cancelled" {
+				t.Fatalf("task status = %q", cancelled.Status)
+			}
+			if _, ok := s.taskLeases[lease.Task.ID]; ok {
+				t.Fatal("task lease was not removed")
+			}
+			run := s.taskRuns[lease.RunID]
+			if run.status != "cancelled" || run.errorCode != "task_cancelled" || run.finishedAt == nil {
+				t.Fatalf("run was not closed: %+v", run)
+			}
+			attempt := s.taskAttemptStates[lease.AttemptID]
+			if attempt.status != "expired" || attempt.errorCode != "task_cancelled" || attempt.finishedAt == nil {
+				t.Fatalf("attempt was not closed: %+v", attempt)
+			}
+			if start && run.status != "cancelled" {
+				t.Fatalf("running task run was not cancelled: %+v", run)
+			}
+			if !start && run.status != "cancelled" {
+				t.Fatalf("leased task run was not cancelled: %+v", run)
+			}
+			if _, err := s.ClaimNextTask(ctx, "worker-2", []string{"system.healthcheck"}, time.Minute, now.Add(2*time.Second)); !errors.Is(err, tasks.ErrNoWork) {
+				t.Fatalf("cancelled task was claimable: %v", err)
+			}
+		})
 	}
 }

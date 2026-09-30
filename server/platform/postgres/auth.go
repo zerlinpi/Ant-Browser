@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -195,6 +196,79 @@ func (s *Store) RevokeSession(ctx context.Context, userID, sessionID, reason str
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func (s *Store) ListActiveSessions(ctx context.Context, userID string, now time.Time, limit int) ([]authservice.Session, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT s.id::text, s.user_id::text, s.device_id, s.user_agent,
+		       COALESCE(host(s.ip_address), ''), s.created_at, s.last_seen_at,
+		       s.expires_at, s.revoked_at, s.revoke_reason
+		FROM sessions s
+		WHERE s.user_id = $1::uuid AND s.revoked_at IS NULL AND s.expires_at > $2
+		ORDER BY s.last_seen_at DESC, s.id
+		LIMIT $3
+	`, userID, now, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]authservice.Session, 0)
+	for rows.Next() {
+		var session authservice.Session
+		if err := rows.Scan(&session.ID, &session.UserID, &session.DeviceID, &session.UserAgent,
+			&session.IPAddress, &session.CreatedAt, &session.LastSeenAt,
+			&session.ExpiresAt, &session.RevokedAt, &session.RevokeReason); err != nil {
+			return nil, err
+		}
+		items = append(items, session)
+	}
+	return items, rows.Err()
+}
+
+func (s *Store) RevokeOtherSessions(ctx context.Context, userID, keepSessionID, reason string, now time.Time) ([]string, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer rollback(ctx, tx)
+	rows, err := tx.Query(ctx, `
+		UPDATE sessions
+		SET revoked_at = $3, revoke_reason = $4
+		WHERE user_id = $1::uuid AND id <> $2::uuid AND revoked_at IS NULL AND expires_at > $3
+		RETURNING id::text
+	`, userID, keepSessionID, now, reason)
+	if err != nil {
+		return nil, err
+	}
+	revoked := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		revoked = append(revoked, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(revoked) != 0 {
+		if _, err := tx.Exec(ctx, `
+			UPDATE refresh_tokens SET revoked_at = COALESCE(revoked_at, $2)
+			WHERE session_id = ANY($1::uuid[])
+		`, revoked, now); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	sort.Strings(revoked)
+	return revoked, nil
 }
 
 func (s *Store) SessionActive(ctx context.Context, userID, sessionID string) (bool, error) {

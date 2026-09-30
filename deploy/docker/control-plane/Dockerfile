@@ -7,10 +7,12 @@ COPY server ./server
 WORKDIR /src/server
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/control-plane ./cmd/control-plane
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/migrate ./cmd/migrate
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/healthcheck ./cmd/healthcheck
 
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 COPY --from=build /out/control-plane /app/control-plane
 COPY --from=build /out/migrate /app/migrate
+COPY --from=build /out/healthcheck /app/healthcheck
 COPY database/migrations /app/database/migrations
 USER nonroot:nonroot
 EXPOSE 8080

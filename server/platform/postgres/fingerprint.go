@@ -17,31 +17,45 @@ const fingerprintColumns = `
 	f.created_at, f.updated_at, f.deleted_at`
 
 func (s *Store) CreateFingerprintTemplate(ctx context.Context, template fingerprintservice.Template) error {
-	runtimeArgs, configuration, err := encodeFingerprintTemplate(template)
+	return s.CreateFingerprintTemplates(ctx, []fingerprintservice.Template{template})
+}
+
+func (s *Store) CreateFingerprintTemplates(ctx context.Context, templates []fingerprintservice.Template) error {
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(ctx, `
-		INSERT INTO fingerprint_templates (
-			id, workspace_id, name, mode, browser_family, browser_major,
-			platform, seed, locale, timezone, runtime_args, configuration,
-			version, created_by, created_at, updated_at, deleted_at
-		) VALUES (
-			$1::uuid, $2::uuid, $3, $4, $5, $6,
-			$7, $8, $9, $10, $11::jsonb, $12::jsonb,
-			$13, NULLIF($14, '')::uuid, $15, $16, $17
-		)
-	`, template.ID, template.WorkspaceID, template.Name, template.Mode,
-		template.BrowserFamily, template.BrowserMajor, template.Platform,
-		template.Seed, template.Locale, template.Timezone, runtimeArgs, configuration,
-		template.Version, template.CreatedBy, template.CreatedAt, template.UpdatedAt, template.DeletedAt)
-	if isUniqueViolation(err) {
-		return errors.New("fingerprint template name already exists")
+	defer rollback(ctx, tx)
+	for _, template := range templates {
+		runtimeArgs, configuration, encodeErr := encodeFingerprintTemplate(template)
+		if encodeErr != nil {
+			return encodeErr
+		}
+		_, insertErr := tx.Exec(ctx, `
+			INSERT INTO fingerprint_templates (
+				id, workspace_id, name, mode, browser_family, browser_major,
+				platform, seed, locale, timezone, runtime_args, configuration,
+				version, created_by, created_at, updated_at, deleted_at
+			) VALUES (
+				$1::uuid, $2::uuid, $3, $4, $5, $6,
+				$7, $8, $9, $10, $11::jsonb, $12::jsonb,
+				$13, NULLIF($14, '')::uuid, $15, $16, $17
+			)
+		`, template.ID, template.WorkspaceID, template.Name, template.Mode,
+			template.BrowserFamily, template.BrowserMajor, template.Platform,
+			template.Seed, template.Locale, template.Timezone, runtimeArgs, configuration,
+			template.Version, template.CreatedBy, template.CreatedAt, template.UpdatedAt, template.DeletedAt)
+		if isUniqueViolation(insertErr) {
+			return fingerprintservice.ErrNameConflict
+		}
+		if isForeignKeyViolation(insertErr) {
+			return fingerprintservice.ErrNotFound
+		}
+		if insertErr != nil {
+			return insertErr
+		}
 	}
-	if isForeignKeyViolation(err) {
-		return fingerprintservice.ErrNotFound
-	}
-	return err
+	return tx.Commit(ctx)
 }
 
 func (s *Store) FindFingerprintTemplate(ctx context.Context, workspaceID, templateID string) (fingerprintservice.Template, error) {
@@ -90,7 +104,7 @@ func (s *Store) UpdateFingerprintTemplate(ctx context.Context, template fingerpr
 		template.BrowserFamily, template.BrowserMajor, template.Platform, template.Seed,
 		template.Locale, template.Timezone, runtimeArgs, configuration, template.UpdatedAt))
 	if isUniqueViolation(err) {
-		return fingerprintservice.Template{}, errors.New("fingerprint template name already exists")
+		return fingerprintservice.Template{}, fingerprintservice.ErrNameConflict
 	}
 	if errors.Is(err, fingerprintservice.ErrNotFound) {
 		if _, findErr := s.FindFingerprintTemplate(ctx, template.WorkspaceID, template.ID); findErr == nil {

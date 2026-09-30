@@ -22,6 +22,10 @@ var (
 	ErrVersionConflict = errors.New("account version conflict")
 	ErrSecretRequired  = errors.New("encrypted secret envelope is required")
 	ErrUnsupported     = errors.New("account repository operation is unsupported")
+	// ErrIdentifierConflict: an identifier is unique per workspace and
+	// platform among live accounts, compared case-insensitively. A deleted
+	// account frees its identifier.
+	ErrIdentifierConflict = errors.New("an account with this identifier already exists on the platform")
 )
 
 type Platform string
@@ -62,6 +66,10 @@ const (
 	RiskMedium    = "medium"
 	RiskHigh      = "high"
 	RiskCritical  = "critical"
+	// RiskInfo is valid only as a risk event severity. Events share the
+	// workspace-wide risk_events severities (info … critical) used by
+	// analytics, while an account's own risk level uses unknown … critical.
+	RiskInfo = "info"
 )
 
 type Account struct {
@@ -220,10 +228,6 @@ type Service struct {
 	crypto     EnvelopeCrypto
 	now        func() time.Time
 }
-
-// AccountService is kept as a domain-oriented name for callers migrating
-// from the legacy account-service package.
-type AccountService = Service
 
 func New(repository Repository, authorizer Authorizer, crypto ...EnvelopeCrypto) *Service {
 	s := &Service{repository: repository, authorizer: authorizer, now: time.Now}
@@ -468,9 +472,9 @@ func (s *Service) RecordRiskEvent(ctx context.Context, actorID, workspaceID, acc
 	if err := s.require(ctx, workspaceID, actorID, memberservice.PermissionAccountManage); err != nil {
 		return RiskEvent{}, err
 	}
-	level = normalizeRisk(level)
-	if !validRisk(level) || strings.TrimSpace(code) == "" {
-		return RiskEvent{}, errors.New("valid risk level and code are required")
+	level = strings.ToLower(strings.TrimSpace(level))
+	if !validRiskEventLevel(level) || strings.TrimSpace(code) == "" {
+		return RiskEvent{}, errors.New("risk event level must be info, low, medium, high or critical, and a code is required")
 	}
 	repository, ok := s.repository.(RiskEventRepository)
 	if !ok {
@@ -635,6 +639,15 @@ func validStatus(value string) bool {
 func validRisk(value string) bool {
 	switch normalizeRisk(value) {
 	case RiskUnknown, RiskLow, RiskMedium, RiskHigh, RiskCritical:
+		return true
+	}
+	return false
+}
+
+// validRiskEventLevel matches the risk_events.severity CHECK constraint.
+func validRiskEventLevel(value string) bool {
+	switch value {
+	case RiskInfo, RiskLow, RiskMedium, RiskHigh, RiskCritical:
 		return true
 	}
 	return false

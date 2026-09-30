@@ -125,6 +125,9 @@ func TestBrowserInstanceUpdateCloneMigrateAndDeleteFlow(t *testing.T) {
 	})
 	assertStatus(t, sourceDeviceResponse, http.StatusCreated)
 	sourceDevice := decodeData[deviceservice.Registration](t, sourceDeviceResponse)
+	cloudProfileResponse := perform(t, handler, http.MethodPost, "/api/v1/workspaces/"+workspace.ID+"/profiles", owner.AccessToken, "", map[string]string{"name": "Migrated storefront profile"})
+	assertStatus(t, cloudProfileResponse, http.StatusCreated)
+	cloudProfile := decodeData[profilesyncservice.Profile](t, cloudProfileResponse)
 	unassignedResponse := perform(t, handler, http.MethodPost, "/api/v1/workspaces/"+workspace.ID+"/browser-instances", owner.AccessToken, "", map[string]interface{}{
 		"name": "Unassigned", "platform": "chromium",
 	})
@@ -135,7 +138,7 @@ func TestBrowserInstanceUpdateCloneMigrateAndDeleteFlow(t *testing.T) {
 	}), http.StatusUnprocessableEntity)
 
 	createdResponse := perform(t, handler, http.MethodPost, "/api/v1/workspaces/"+workspace.ID+"/browser-instances", owner.AccessToken, "", map[string]interface{}{
-		"name": "Storefront", "platform": "chromium", "tags": []string{"shopify"}, "assignedDeviceId": sourceDevice.Device.ID,
+		"name": "Storefront", "platform": "chromium", "tags": []string{"shopify"}, "assignedDeviceId": sourceDevice.Device.ID, "profileId": cloudProfile.ID,
 	})
 	assertStatus(t, createdResponse, http.StatusCreated)
 	created := decodeData[browserinstanceservice.BrowserInstance](t, createdResponse)
@@ -173,6 +176,13 @@ func TestBrowserInstanceUpdateCloneMigrateAndDeleteFlow(t *testing.T) {
 		"action": "instance.migrate", "expectedVersion": 2, "payload": map[string]interface{}{"targetDeviceId": device.Device.ID},
 	})
 	assertStatus(t, migrateResponse, http.StatusAccepted)
+	migrateResult := decodeData[struct {
+		Command browserinstanceservice.Command `json:"command"`
+	}](t, migrateResponse)
+	migration := migrateResult.Command
+	if window := migration.Deadline.Sub(migration.CreatedAt); window < 29*time.Minute || window > 31*time.Minute {
+		t.Fatalf("migration command deadline window = %s, want approximately 30m", window)
+	}
 	conflictingReplay := perform(t, handler, http.MethodPost, "/api/v1/workspaces/"+workspace.ID+"/browser-instances/"+created.ID+"/commands", owner.AccessToken, "migrate-once", map[string]interface{}{
 		"action": "instance.migrate", "expectedVersion": 2, "payload": map[string]interface{}{"targetDeviceId": device.Device.ID, "changed": true},
 	})
@@ -487,12 +497,65 @@ func TestProfileSyncAPIFlow(t *testing.T) {
 	assertStatus(t, missing, http.StatusNotFound)
 }
 
-func newTestGateway() http.Handler {
-	handler, _ := newTestGatewayWithStore()
+func TestDeviceProfileAPIIsLimitedToAssignedProfiles(t *testing.T) {
+	t.Parallel()
+	handler := newTestGateway()
+	owner := register(t, handler, "device-profile-owner@example.com")
+	workspaceResponse := perform(t, handler, http.MethodPost, "/api/v1/workspaces", owner.AccessToken, "", map[string]string{"name": "Device Profile Team"})
+	assertStatus(t, workspaceResponse, http.StatusCreated)
+	workspace := decodeData[workspaceservice.Workspace](t, workspaceResponse)
+	deviceResponse := perform(t, handler, http.MethodPost, "/api/v1/devices", owner.AccessToken, "", map[string]interface{}{
+		"workspaceId": workspace.ID, "name": "Assigned device", "platform": "windows", "agentVersion": "2.0.0",
+	})
+	assertStatus(t, deviceResponse, http.StatusCreated)
+	device := decodeData[deviceservice.Registration](t, deviceResponse)
+	otherDeviceResponse := perform(t, handler, http.MethodPost, "/api/v1/devices", owner.AccessToken, "", map[string]interface{}{
+		"workspaceId": workspace.ID, "name": "Other device", "platform": "linux", "agentVersion": "2.0.0",
+	})
+	assertStatus(t, otherDeviceResponse, http.StatusCreated)
+	otherDevice := decodeData[deviceservice.Registration](t, otherDeviceResponse)
+	profileResponse := perform(t, handler, http.MethodPost, "/api/v1/workspaces/"+workspace.ID+"/profiles", owner.AccessToken, "", map[string]string{"name": "Assigned profile"})
+	assertStatus(t, profileResponse, http.StatusCreated)
+	profile := decodeData[profilesyncservice.Profile](t, profileResponse)
+	unassignedResponse := perform(t, handler, http.MethodPost, "/api/v1/workspaces/"+workspace.ID+"/profiles", owner.AccessToken, "", map[string]string{"name": "Unassigned profile"})
+	assertStatus(t, unassignedResponse, http.StatusCreated)
+	unassigned := decodeData[profilesyncservice.Profile](t, unassignedResponse)
+	instanceResponse := perform(t, handler, http.MethodPost, "/api/v1/workspaces/"+workspace.ID+"/browser-instances", owner.AccessToken, "", map[string]interface{}{
+		"name": "Assigned instance", "platform": "chromium", "assignedDeviceId": device.Device.ID, "profileId": profile.ID,
+	})
+	assertStatus(t, instanceResponse, http.StatusCreated)
+
+	get := performDevice(t, handler, http.MethodGet, "/api/v1/agent/profiles/"+profile.ID, device.Device.ID, device.Credential, nil)
+	assertStatus(t, get, http.StatusOK)
+	if got := decodeData[profilesyncservice.Profile](t, get); got.ID != profile.ID {
+		t.Fatalf("device received wrong profile: %+v", got)
+	}
+	lease := performDevice(t, handler, http.MethodPost, "/api/v1/agent/profiles/"+profile.ID+"/lease", device.Device.ID, device.Credential, map[string]interface{}{
+		"deviceId": device.Device.ID, "ttlSeconds": 300,
+	})
+	assertStatus(t, lease, http.StatusCreated)
+	grant := decodeData[profilesyncservice.LeaseGrant](t, lease)
+	if grant.Lease.HolderDeviceID != device.Device.ID || grant.Token == "" {
+		t.Fatalf("device lease was not scoped: %+v", grant)
+	}
+	spoofed := performDevice(t, handler, http.MethodPost, "/api/v1/agent/profiles/"+profile.ID+"/lease", device.Device.ID, device.Credential, map[string]interface{}{
+		"deviceId": otherDevice.Device.ID, "ttlSeconds": 300,
+	})
+	assertStatus(t, spoofed, http.StatusForbidden)
+	assertStatus(t, performDevice(t, handler, http.MethodGet, "/api/v1/agent/profiles/"+unassigned.ID, device.Device.ID, device.Credential, nil), http.StatusNotFound)
+	assertStatus(t, performDevice(t, handler, http.MethodGet, "/api/v1/agent/profiles/"+profile.ID, otherDevice.Device.ID, otherDevice.Credential, nil), http.StatusNotFound)
+	assertStatus(t, performDevice(t, handler, http.MethodGet, "/api/v1/agent/profiles/"+profile.ID, device.Device.ID, "invalid", nil), http.StatusUnauthorized)
+}
+
+// newTestGateway builds a fully wired gateway over a fresh memory store.
+// Extra options (for example gatewayservice.RateLimits or TrustedProxies) are
+// appended to NewWithInfrastructure's options.
+func newTestGateway(options ...interface{}) http.Handler {
+	handler, _ := newTestGatewayWithStore(options...)
 	return handler
 }
 
-func newTestGatewayWithStore() (http.Handler, *memory.Store) {
+func newTestGatewayWithStore(options ...interface{}) (http.Handler, *memory.Store) {
 	store := memory.New()
 	tokens := security.NewTokens("test-issuer", "01234567890123456789012345678901", 5*time.Minute)
 	auth := authservice.New(store, security.NewPasswords(), tokens, security.NewOpaqueToken, 24*time.Hour)
@@ -510,6 +573,11 @@ func newTestGatewayWithStore() (http.Handler, *memory.Store) {
 	if err != nil {
 		panic(err)
 	}
+	mfaSealer, err := secureenvelope.NewTextSealer(encryption)
+	if err != nil {
+		panic(err)
+	}
+	auth.ConfigureMFA(mfaSealer, "Ant Browser")
 	secrets, err := secureenvelope.NewProxyProvider(store, encryption)
 	if err != nil {
 		panic(err)
@@ -524,7 +592,7 @@ func newTestGatewayWithStore() (http.Handler, *memory.Store) {
 	handler := gatewayservice.NewWithInfrastructure(
 		context.Background(), auth, workspaces, devices, instances, tokens, store,
 		realtime.NewDisabled(), tasks, taskwake.NewDisabled(), fingerprints, profiles, workflows, accounts, proxies, logger,
-		analytics, admin, batches, billing,
+		append([]interface{}{analytics, admin, batches, billing}, options...)...,
 	)
 	return handler, store
 }
@@ -558,6 +626,28 @@ func perform(t *testing.T, handler http.Handler, method, path, accessToken, idem
 	}
 	if idempotencyKey != "" {
 		request.Header.Set("Idempotency-Key", idempotencyKey)
+	}
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	return recorder
+}
+
+func performDevice(t *testing.T, handler http.Handler, method, path, deviceID, credential string, body interface{}) *httptest.ResponseRecorder {
+	t.Helper()
+	var reader io.Reader
+	if body != nil {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reader = bytes.NewReader(encoded)
+	}
+	request := httptest.NewRequest(method, path, reader)
+	request.RemoteAddr = "127.0.0.1:12345"
+	request.Header.Set("Authorization", "Device "+credential)
+	request.Header.Set("X-Device-ID", deviceID)
+	if body != nil {
+		request.Header.Set("Content-Type", "application/json")
 	}
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, request)

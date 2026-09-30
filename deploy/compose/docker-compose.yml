@@ -61,7 +61,9 @@ services:
     volumes:
       - minio-data:/data
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9000/minio/health/live >/dev/null"]
+      # The minio/minio image is ubi-micro based and ships neither wget nor
+      # curl; the bundled mc client probes its pre-configured "local" alias.
+      test: ["CMD", "mc", "ready", "local"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -105,7 +107,11 @@ services:
       ANT_ENCRYPTION_KEY_REF: ${ENCRYPTION_KEY_REF:?set ENCRYPTION_KEY_REF}
       ANT_SECRET_MASTER_KEY: ${SECRET_MASTER_KEY:?set SECRET_MASTER_KEY}
       ANT_SECRET_KEY_VERSION: ${SECRET_KEY_VERSION:-v1}
+      ANT_ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?set ALLOWED_ORIGINS to exact comma-separated desktop/web origins}
       ANT_ALLOW_MEMORY_STORE: "false"
+      # X-Forwarded-For / X-Real-IP are honoured only from these peers. The
+      # default is the pinned cloud network below, i.e. the bundled Nginx.
+      ANT_TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-${CLOUD_NETWORK_SUBNET:-172.28.0.0/16}}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -115,6 +121,12 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "http://127.0.0.1:8080/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
     expose: ["8080"]
     networks: [cloud]
 
@@ -124,6 +136,10 @@ services:
       dockerfile: deploy/docker/worker/Dockerfile
       target: runtime
     restart: unless-stopped
+    # Least privilege: the worker reads only these settings
+    # (server/platform/config LoadWorker). It never touches object storage, so
+    # it gets no MinIO credentials. Envelope/master-key settings are added by
+    # proxy-health.yml because only the proxy probe decrypts secrets.
     environment:
       ANT_ENV: ${APP_ENV:-production}
       ANT_WORKER_DATABASE_URL: ${WORKER_DATABASE_URL:?set WORKER_DATABASE_URL (ant_worker role)}
@@ -134,22 +150,12 @@ services:
       ANT_SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       ANT_SMTP_FROM: ${SMTP_FROM:-}
       ANT_SMTP_TLS_MODE: ${SMTP_TLS_MODE:-starttls}
-      ANT_OBJECT_STORE_URL: ${S3_ENDPOINT:?set S3_ENDPOINT}
-      ANT_OBJECT_STORE_BUCKET: ${S3_BUCKET:?set S3_BUCKET}
-      ANT_OBJECT_STORE_ACCESS_KEY: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
-      ANT_OBJECT_STORE_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
-      ANT_OBJECT_STORE_REGION: ${S3_REGION:-us-east-1}
-      ANT_OBJECT_STORE_AUTO_CREATE_BUCKET: "true"
-      ANT_ENCRYPTION_KEY_REF: ${ENCRYPTION_KEY_REF:?set ENCRYPTION_KEY_REF}
-      ANT_ALLOW_MEMORY_STORE: "false"
     depends_on:
       migrate:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
       nats:
-        condition: service_healthy
-      minio:
         condition: service_healthy
     networks: [cloud]
 
@@ -171,7 +177,7 @@ services:
       - ../nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
       control-plane:
-        condition: service_started
+        condition: service_healthy
       frontend:
         condition: service_started
     networks: [cloud]
@@ -185,3 +191,9 @@ volumes:
 networks:
   cloud:
     driver: bridge
+    ipam:
+      config:
+        # Pinned so ANT_TRUSTED_PROXY_CIDRS can name the Nginx peer range.
+        # Override CLOUD_NETWORK_SUBNET (and TRUSTED_PROXY_CIDRS) if it
+        # overlaps an existing Docker network, VPN, or host route.
+        - subnet: ${CLOUD_NETWORK_SUBNET:-172.28.0.0/16}

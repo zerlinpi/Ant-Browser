@@ -20,6 +20,9 @@ var (
 	ErrInvalidAction            = errors.New("invalid browser instance action")
 	ErrIdempotencyConflict      = errors.New("idempotency key already used for another command")
 	ErrInvalidCommandTransition = errors.New("invalid command status transition")
+	// ErrNameConflict: names are unique per workspace among live instances,
+	// compared case-insensitively. A deleted instance frees its name.
+	ErrNameConflict = errors.New("browser instance name already exists")
 )
 
 type BrowserInstance struct {
@@ -317,6 +320,9 @@ func (s *Service) RequestCommand(ctx context.Context, actorID, workspaceID, inst
 		return Command{}, BrowserInstance{}, ErrInvalidInput
 	}
 	if action == "instance.migrate" {
+		if strings.TrimSpace(instance.ProfileID) == "" {
+			return Command{}, BrowserInstance{}, ErrInvalidInput
+		}
 		if targetDeviceID == instance.AssignedDeviceID {
 			return Command{}, BrowserInstance{}, ErrInvalidInput
 		}
@@ -326,11 +332,12 @@ func (s *Service) RequestCommand(ctx context.Context, actorID, workspaceID, inst
 		}
 	}
 	now := s.now().UTC()
+	deadline := now.Add(commandDeadline(action, instance.ProfileID))
 	command := Command{
 		ID: uuid.NewString(), WorkspaceID: workspaceID, InstanceID: instanceID,
 		DeviceID: instance.AssignedDeviceID, Action: action, IdempotencyKey: idempotencyKey,
 		ExpectedVersion: input.ExpectedVersion, Status: "pending", Payload: input.Payload,
-		Deadline: now.Add(2 * time.Minute), CreatedBy: actorID, CreatedAt: now,
+		Deadline: deadline, CreatedBy: actorID, CreatedAt: now,
 	}
 	return s.repository.CreateCommand(ctx, command, desiredState)
 }
@@ -343,6 +350,32 @@ func (s *Service) PendingCommands(ctx context.Context, workspaceID, deviceID str
 		return nil, err
 	}
 	return s.repository.ListPendingCommands(ctx, workspaceID, deviceID)
+}
+
+// RequireDeviceProfileAccess prevents a device credential from becoming a
+// workspace-wide profile decryption credential. A device can synchronize only
+// profiles referenced by browser instances currently assigned to that device.
+func (s *Service) RequireDeviceProfileAccess(ctx context.Context, workspaceID, deviceID, profileID string) error {
+	for _, value := range []string{workspaceID, deviceID, profileID} {
+		parsed, err := uuid.Parse(strings.TrimSpace(value))
+		if err != nil || parsed.String() != strings.TrimSpace(value) {
+			return ErrNotFound
+		}
+	}
+	device, err := s.repository.FindDevice(ctx, deviceID)
+	if err != nil || device.WorkspaceID != workspaceID || device.RevokedAt != nil {
+		return ErrNotFound
+	}
+	instances, err := s.repository.ListInstances(ctx, workspaceID)
+	if err != nil {
+		return err
+	}
+	for _, instance := range instances {
+		if instance.AssignedDeviceID == deviceID && instance.ProfileID == profileID && instance.DeletedAt == nil {
+			return nil
+		}
+	}
+	return ErrNotFound
 }
 
 func (s *Service) ApplyAgentCommandEvent(ctx context.Context, workspaceID, deviceID, commandID string, input AgentCommandEventInput) (Command, error) {
@@ -370,6 +403,26 @@ func (s *Service) ApplyObservedState(ctx context.Context, workspaceID, deviceID,
 
 func IsTerminalCommandStatus(status string) bool {
 	return status == "completed" || status == "failed" || status == "cancelled" || status == "expired"
+}
+
+func MigrationStartIdempotencyKey(migrationCommandID string) string {
+	return "migration-target-start:" + strings.TrimSpace(migrationCommandID)
+}
+
+const (
+	lifecycleCommandTimeout   = 2 * time.Minute
+	profileSyncCommandTimeout = 30 * time.Minute
+)
+
+// commandDeadline bounds how long an agent may take for a command. Migration
+// always uploads the encrypted profile. For an instance bound to a cloud
+// profile, start restores the latest revision and stop/restart upload one,
+// so they get the same budget instead of failing mid-transfer on slow links.
+func commandDeadline(action, profileID string) time.Duration {
+	if action == "instance.migrate" || strings.TrimSpace(profileID) != "" {
+		return profileSyncCommandTimeout
+	}
+	return lifecycleCommandTimeout
 }
 
 func CanTransitionCommand(from, to string) bool {

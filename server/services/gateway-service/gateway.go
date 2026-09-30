@@ -5,8 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
-	"net"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,7 +74,18 @@ type Gateway struct {
 	admin           *adminservice.Service
 	batch           *batchservice.Service
 	billing         *billingservice.Service
+	allowedOrigins  []string
+	clientIPs       *httpx.ClientIPResolver
+	limits          *rateLimiters
+	// extensions holds feature dependencies registered in extensions.go.
+	extensions map[interface{}]interface{}
 }
+
+// AllowedOrigins configures exact browser origins for authenticated CORS and
+// notification WebSocket handshakes. Its distinct type avoids mistaking an
+// arbitrary string slice for a service dependency in the compatibility
+// options list.
+type AllowedOrigins []string
 
 func New(
 	auth *authservice.Service,
@@ -137,7 +149,10 @@ func NewWithInfrastructure(
 		tokens: tokens, dependency: dependency, logger: logger, agentHub: newAgentHub(), notificationHub: newNotificationHub(),
 		realtime: realtimeBus, nodeID: uuid.NewString(), tasks: tasks, taskWake: taskWake,
 		fingerprints: fingerprints, profiles: profiles, workflows: workflows, accounts: accounts, proxies: proxies,
+		extensions: make(map[interface{}]interface{}),
 	}
+	var trustedProxies TrustedProxies
+	var rateLimits *RateLimits
 	for _, option := range options {
 		switch value := option.(type) {
 		case *notificationservice.Service:
@@ -152,8 +167,18 @@ func NewWithInfrastructure(
 			gateway.batch = value
 		case *billingservice.Service:
 			gateway.billing = value
+		case AllowedOrigins:
+			gateway.allowedOrigins = append([]string(nil), value...)
+		case TrustedProxies:
+			trustedProxies = append(TrustedProxies(nil), value...)
+		case RateLimits:
+			rateLimits = &value
+		default:
+			gateway.handleExtensionOption(option)
 		}
 	}
+	gateway.clientIPs = gateway.newClientIPResolver(trustedProxies)
+	gateway.limits = newRateLimiters(rateLimits)
 	gateway.subscribeCommands(ctx)
 	if gateway.notifications != nil {
 		gateway.subscribeNotifications(ctx)
@@ -162,10 +187,36 @@ func NewWithInfrastructure(
 
 	mux.HandleFunc("GET /healthz", gateway.health)
 	mux.HandleFunc("GET /readyz", gateway.ready)
-	mux.HandleFunc("POST /api/v1/auth/register", gateway.register)
-	mux.HandleFunc("POST /api/v1/auth/login", gateway.login)
-	mux.HandleFunc("POST /api/v1/auth/refresh", gateway.refresh)
-	mux.HandleFunc("GET /api/v1/agent/ws", gateway.agentSocket)
+	// Credential endpoints are rate limited per resolved client IP; login is
+	// additionally limited per normalized email inside the handler.
+	mux.HandleFunc("POST /api/v1/auth/register", gateway.limitByClientIP(gateway.limits.registerIP, gateway.register))
+	mux.HandleFunc("POST /api/v1/auth/login", gateway.limitByClientIP(gateway.limits.loginIP, gateway.login))
+	mux.HandleFunc("POST /api/v1/auth/refresh", gateway.limitByClientIP(gateway.limits.refreshIP, gateway.refresh))
+	mux.HandleFunc("POST /api/v1/auth/mfa/verify", gateway.limitByClientIP(gateway.limits.mfaVerifyIP, gateway.verifyMFA))
+	// Every device-credential route authenticates through
+	// withAgentAuthentication, which turns infrastructure failures into 503
+	// dependency_unavailable rather than a credential rejection.
+	agentRoute := gateway.withAgentAuthentication
+	mux.HandleFunc("GET /api/v1/agent/ws", agentRoute(gateway.agentSocket))
+	if fingerprints != nil {
+		mux.HandleFunc("GET /api/v1/agent/instances/{instanceID}/runtime-config", agentRoute(gateway.getAgentInstanceRuntimeConfig))
+	}
+	if profiles != nil {
+		deviceProfile := func(next http.HandlerFunc) http.HandlerFunc {
+			return agentRoute(gateway.deviceProfile(next))
+		}
+		mux.HandleFunc("GET /api/v1/agent/profiles/{profileID}", deviceProfile(gateway.getProfile))
+		mux.HandleFunc("POST /api/v1/agent/profiles/{profileID}/lease", deviceProfile(gateway.acquireProfileLease))
+		mux.HandleFunc("POST /api/v1/agent/profiles/{profileID}/lease/renew", deviceProfile(gateway.renewProfileLease))
+		mux.HandleFunc("DELETE /api/v1/agent/profiles/{profileID}/lease", deviceProfile(gateway.releaseProfileLease))
+		mux.HandleFunc("POST /api/v1/agent/profiles/{profileID}/revisions", deviceProfile(gateway.beginProfileRevision))
+		mux.HandleFunc("GET /api/v1/agent/profiles/{profileID}/revisions", deviceProfile(gateway.listProfileRevisions))
+		mux.HandleFunc("GET /api/v1/agent/profiles/{profileID}/revisions/{revisionID}", deviceProfile(gateway.getProfileRevision))
+		mux.HandleFunc("POST /api/v1/agent/profiles/{profileID}/revisions/{revisionID}/objects/{objectID}/upload", deviceProfile(gateway.prepareProfileObjectUpload))
+		mux.HandleFunc("GET /api/v1/agent/profiles/{profileID}/revisions/{revisionID}/objects/{objectID}/download", deviceProfile(gateway.prepareProfileObjectDownload))
+		mux.HandleFunc("POST /api/v1/agent/profiles/{profileID}/revisions/{revisionID}/commit", deviceProfile(gateway.commitProfileRevision))
+		mux.HandleFunc("POST /api/v1/agent/profiles/{profileID}/revisions/{revisionID}/restore", deviceProfile(gateway.restoreProfileRevision))
+	}
 	if gateway.billing != nil {
 		mux.HandleFunc("GET /api/v1/billing/plans", gateway.listBillingPlans)
 		mux.HandleFunc("GET /api/v1/billing/release-channels", gateway.listReleaseChannels)
@@ -174,12 +225,20 @@ func NewWithInfrastructure(
 		mux.HandleFunc("GET /api/v1/notifications/ws", gateway.notificationSocket)
 	}
 	if tasks != nil {
-		mux.HandleFunc("POST /api/v1/agent/tasks/claim", gateway.claimAgentTask)
-		mux.HandleFunc("POST /api/v1/agent/tasks/{taskID}/report", gateway.reportAgentTask)
+		mux.HandleFunc("POST /api/v1/agent/tasks/claim", agentRoute(gateway.claimAgentTask))
+		mux.HandleFunc("POST /api/v1/agent/tasks/{taskID}/report", agentRoute(gateway.reportAgentTask))
 	}
 
 	protected := http.NewServeMux()
 	protected.HandleFunc("GET /api/v1/me", gateway.me)
+	protected.HandleFunc("GET /api/v1/me/sessions", gateway.listSessions)
+	protected.HandleFunc("POST /api/v1/me/sessions/revoke-others", gateway.revokeOtherSessions)
+	protected.HandleFunc("DELETE /api/v1/me/sessions/{sessionID}", gateway.revokeSession)
+	protected.HandleFunc("GET /api/v1/me/mfa", gateway.getMFAStatus)
+	protected.HandleFunc("DELETE /api/v1/me/mfa", gateway.disableMFA)
+	protected.HandleFunc("POST /api/v1/me/mfa/totp/setup", gateway.setupTOTP)
+	protected.HandleFunc("POST /api/v1/me/mfa/totp/confirm", gateway.confirmTOTP)
+	protected.HandleFunc("POST /api/v1/me/mfa/recovery-codes", gateway.regenerateRecoveryCodes)
 	protected.HandleFunc("POST /api/v1/auth/logout", gateway.logout)
 	protected.HandleFunc("GET /api/v1/workspaces", gateway.listWorkspaces)
 	protected.HandleFunc("POST /api/v1/workspaces", gateway.createWorkspace)
@@ -187,13 +246,16 @@ func NewWithInfrastructure(
 	protected.HandleFunc("PATCH /api/v1/workspaces/{workspaceID}", gateway.updateWorkspace)
 	protected.HandleFunc("GET /api/v1/workspaces/{workspaceID}/members", gateway.listMembers)
 	protected.HandleFunc("POST /api/v1/workspaces/{workspaceID}/members", gateway.addMember)
+	protected.HandleFunc("PATCH /api/v1/workspaces/{workspaceID}/members/{userID}", gateway.updateMember)
+	protected.HandleFunc("DELETE /api/v1/workspaces/{workspaceID}/members/{userID}", gateway.removeMember)
 	protected.HandleFunc("GET /api/v1/workspaces/{workspaceID}/invitations", gateway.listInvitations)
 	protected.HandleFunc("POST /api/v1/workspaces/{workspaceID}/invitations", gateway.createInvitation)
 	protected.HandleFunc("DELETE /api/v1/workspaces/{workspaceID}/invitations/{invitationID}", gateway.revokeInvitation)
-	protected.HandleFunc("POST /api/v1/workspaces/{workspaceID}/invitations/accept", gateway.acceptInvitation)
+	protected.HandleFunc("POST /api/v1/workspaces/{workspaceID}/invitations/accept", gateway.limitByClientIP(gateway.limits.acceptIP, gateway.acceptInvitation))
 	protected.HandleFunc("GET /api/v1/devices", gateway.listDevices)
 	protected.HandleFunc("POST /api/v1/devices", gateway.registerDevice)
 	protected.HandleFunc("DELETE /api/v1/devices/{deviceID}", gateway.revokeDevice)
+	protected.HandleFunc("POST /api/v1/devices/{deviceID}/rotate-credential", gateway.rotateDeviceCredential)
 	protected.HandleFunc("GET /api/v1/workspaces/{workspaceID}/browser-instances", gateway.listInstances)
 	protected.HandleFunc("POST /api/v1/workspaces/{workspaceID}/browser-instances", gateway.createInstance)
 	protected.HandleFunc("GET /api/v1/workspaces/{workspaceID}/browser-instances/{instanceID}", gateway.getInstance)
@@ -208,8 +270,10 @@ func NewWithInfrastructure(
 		protected.HandleFunc("POST /api/v1/workspaces/{workspaceID}/tasks/{taskID}/cancel", gateway.cancelTask)
 	}
 	if fingerprints != nil {
+		protected.HandleFunc("GET /api/v1/workspaces/{workspaceID}/fingerprint-presets", gateway.listFingerprintPresets)
 		protected.HandleFunc("GET /api/v1/workspaces/{workspaceID}/fingerprint-templates", gateway.listFingerprintTemplates)
 		protected.HandleFunc("POST /api/v1/workspaces/{workspaceID}/fingerprint-templates", gateway.createFingerprintTemplate)
+		protected.HandleFunc("POST /api/v1/workspaces/{workspaceID}/fingerprint-templates/batch", gateway.createFingerprintTemplateBatch)
 		protected.HandleFunc("GET /api/v1/workspaces/{workspaceID}/fingerprint-templates/{templateID}", gateway.getFingerprintTemplate)
 		protected.HandleFunc("PATCH /api/v1/workspaces/{workspaceID}/fingerprint-templates/{templateID}", gateway.updateFingerprintTemplate)
 		protected.HandleFunc("DELETE /api/v1/workspaces/{workspaceID}/fingerprint-templates/{templateID}", gateway.deleteFingerprintTemplate)
@@ -288,6 +352,8 @@ func NewWithInfrastructure(
 		protected.HandleFunc("PATCH /api/v1/workspaces/{workspaceID}/proxies/{proxyID}", gateway.updateProxy)
 		protected.HandleFunc("DELETE /api/v1/workspaces/{workspaceID}/proxies/{proxyID}", gateway.deleteProxy)
 		protected.HandleFunc("POST /api/v1/workspaces/{workspaceID}/proxies/{proxyID}/assignments", gateway.assignProxy)
+		protected.HandleFunc("GET /api/v1/workspaces/{workspaceID}/proxy-assignments", gateway.listProxyAssignments)
+		protected.HandleFunc("GET /api/v1/workspaces/{workspaceID}/proxy-assignments/{targetType}/{targetID}", gateway.getProxyAssignment)
 		protected.HandleFunc("DELETE /api/v1/workspaces/{workspaceID}/proxy-assignments/{targetType}/{targetID}", gateway.unassignProxy)
 		protected.HandleFunc("GET /api/v1/workspaces/{workspaceID}/proxies/{proxyID}/health-checks", gateway.listProxyHealthChecks)
 		protected.HandleFunc("POST /api/v1/workspaces/{workspaceID}/proxies/{proxyID}/health-checks", gateway.requestProxyHealthCheck)
@@ -317,11 +383,12 @@ func NewWithInfrastructure(
 		protected.HandleFunc("POST /api/v1/organizations/{organizationID}/billing/licenses/validate", gateway.validateLicense)
 		protected.HandleFunc("DELETE /api/v1/organizations/{organizationID}/billing/licenses/{activationID}", gateway.revokeLicense)
 	}
-	mux.Handle("/api/v1/", gateway.authenticate(protected))
+	gateway.registerExtensionRoutes(mux, protected)
+	mux.Handle("/api/v1/", gateway.authenticate(gateway.wrapProtected(protected)))
 
 	return httpx.RequestIDMiddleware(
 		httpx.SecurityHeaders(
-			httpx.Recover(logger, httpx.AccessLog(logger, mux)),
+			httpx.Recover(logger, httpx.AccessLog(logger, httpx.CORS(gateway.allowedOrigins, mux))),
 		),
 	)
 }
@@ -348,7 +415,7 @@ func (g *Gateway) register(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, err)
 		return
 	}
-	pair, err := g.auth.Register(r.Context(), input, requestMetadata(r))
+	pair, err := g.auth.Register(r.Context(), input, g.requestMetadata(r))
 	if err != nil {
 		g.writeServiceError(w, r, err)
 		return
@@ -362,12 +429,65 @@ func (g *Gateway) login(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, err)
 		return
 	}
-	pair, err := g.auth.Login(r.Context(), input, requestMetadata(r))
+	// The per-IP limit ran before decoding. The per-account limit slows
+	// password guessing against one email spread across many IPs; it is
+	// checked before any password hashing work.
+	if key := loginEmailKey(input.Email); key != "" && !allowRequest(w, r, g.limits.loginEmail, key) {
+		return
+	}
+	metadata := g.requestMetadata(r)
+	metadata.DeviceID = strings.TrimSpace(input.DeviceID)
+	result, err := g.auth.Login(r.Context(), input, metadata)
 	if err != nil {
 		g.writeServiceError(w, r, err)
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]interface{}{"data": pair})
+	// Accounts with two-factor authentication get a challenge for
+	// /auth/mfa/verify; the sign-in is announced once it completes.
+	if result.TokenPair != nil {
+		g.publishLoginSecurityEvents(r.Context(), *result.TokenPair, metadata, "")
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]interface{}{"data": result})
+}
+
+// publishLoginSecurityEvents announces a new session. secondFactor is the
+// method that completed a two-factor sign-in, or empty.
+func (g *Gateway) publishLoginSecurityEvents(ctx context.Context, pair authservice.TokenPair, metadata authservice.SessionMetadata, secondFactor string) {
+	body := "A new session signed in to your Ant Browser account."
+	payload := map[string]interface{}{
+		"sessionId": pair.SessionID, "deviceId": metadata.DeviceID,
+		"ipAddress": metadata.IPAddress, "userAgent": metadata.UserAgent,
+	}
+	if secondFactor != "" {
+		payload["secondFactor"] = secondFactor
+		if secondFactor == authservice.MFAMethodRecoveryCode {
+			body = "A new session signed in to your Ant Browser account with a recovery code."
+		}
+	}
+	g.publishSecurityEvent(ctx, pair.User.ID, "New account sign-in", body, payload, "security-login:"+pair.SessionID)
+}
+
+// publishSecurityEvent notifies the user in each of their workspaces. It is
+// best effort: failures are logged and never fail the request.
+func (g *Gateway) publishSecurityEvent(ctx context.Context, userID, title, body string, payload map[string]interface{}, idempotencyKey string) {
+	if g.notifications == nil || g.workspaces == nil {
+		return
+	}
+	workspaces, err := g.workspaces.List(ctx, userID)
+	if err != nil {
+		g.logger.WarnContext(ctx, "security_notification_workspace_list_failed", "user_id", userID, "error", err)
+		return
+	}
+	for _, workspace := range workspaces {
+		_, publishErr := g.notifications.Publish(ctx, notificationservice.CreateInput{
+			WorkspaceID: workspace.ID, RecipientUserID: userID,
+			EventType: "security.event", Title: title, Body: body,
+			Payload: payload, IdempotencyKey: idempotencyKey,
+		})
+		if publishErr != nil {
+			g.logger.WarnContext(ctx, "security_notification_publish_failed", "workspace_id", workspace.ID, "user_id", userID, "error", publishErr)
+		}
+	}
 }
 
 func (g *Gateway) refresh(w http.ResponseWriter, r *http.Request) {
@@ -392,7 +512,40 @@ func (g *Gateway) logout(w http.ResponseWriter, r *http.Request) {
 		g.writeServiceError(w, r, err)
 		return
 	}
+	g.notificationHub.closeSessions(identity.UserID, identity.SessionID)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (g *Gateway) listSessions(w http.ResponseWriter, r *http.Request) {
+	identity := mustPrincipal(r.Context())
+	items, err := g.auth.ListSessions(r.Context(), identity.UserID, identity.SessionID)
+	if err != nil {
+		g.writeServiceError(w, r, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]interface{}{"data": items})
+}
+
+func (g *Gateway) revokeSession(w http.ResponseWriter, r *http.Request) {
+	identity := mustPrincipal(r.Context())
+	sessionID := strings.TrimSpace(r.PathValue("sessionID"))
+	if err := g.auth.RevokeUserSession(r.Context(), identity.UserID, identity.SessionID, sessionID); err != nil {
+		g.writeServiceError(w, r, err)
+		return
+	}
+	g.notificationHub.closeSessions(identity.UserID, sessionID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (g *Gateway) revokeOtherSessions(w http.ResponseWriter, r *http.Request) {
+	identity := mustPrincipal(r.Context())
+	revoked, err := g.auth.RevokeOtherSessions(r.Context(), identity.UserID, identity.SessionID)
+	if err != nil {
+		g.writeServiceError(w, r, err)
+		return
+	}
+	g.notificationHub.closeSessions(identity.UserID, revoked...)
+	httpx.WriteJSON(w, http.StatusOK, map[string]interface{}{"data": map[string]int{"revoked": len(revoked)}})
 }
 
 func (g *Gateway) me(w http.ResponseWriter, r *http.Request) {
@@ -508,10 +661,13 @@ func (g *Gateway) registerDevice(w http.ResponseWriter, r *http.Request) {
 }
 
 func (g *Gateway) revokeDevice(w http.ResponseWriter, r *http.Request) {
-	if err := g.devices.Revoke(r.Context(), mustPrincipal(r.Context()).UserID, r.PathValue("deviceID")); err != nil {
+	deviceID := strings.TrimSpace(r.PathValue("deviceID"))
+	if err := g.devices.Revoke(r.Context(), mustPrincipal(r.Context()).UserID, deviceID); err != nil {
 		g.writeServiceError(w, r, err)
 		return
 	}
+	// A revoked device must not keep a socket authenticated before revocation.
+	g.disconnectAgentDevices(r.Context(), deviceID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -714,6 +870,10 @@ func (g *Gateway) meterAPIRequest(ctx context.Context, r *http.Request, identity
 }
 
 func (g *Gateway) writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
+	if problem, ok := g.mapExtensionError(w, r, err); ok {
+		httpx.WriteError(w, r, problem)
+		return
+	}
 	problem := httpx.Problem{Status: http.StatusInternalServerError, Code: "internal_error", Message: "The request could not be completed"}
 	switch {
 	case errors.Is(err, batchservice.ErrBatchTooLarge):
@@ -728,18 +888,68 @@ func (g *Gateway) writeServiceError(w http.ResponseWriter, r *http.Request, err 
 		problem = httpx.Problem{Status: http.StatusRequestTimeout, Code: "request_cancelled", Message: "The batch operation was cancelled"}
 	case errors.Is(err, accountservice.ErrNotFound), errors.Is(err, proxyservice.ErrNotFound):
 		problem = httpx.Problem{Status: http.StatusNotFound, Code: "not_found", Message: "Resource was not found"}
-	case errors.Is(err, accountservice.ErrVersionConflict), errors.Is(err, proxyservice.ErrVersionConflict), errors.Is(err, proxyservice.ErrAssignmentConflict):
+	case errors.Is(err, accountservice.ErrVersionConflict), errors.Is(err, proxyservice.ErrVersionConflict):
 		problem = httpx.Problem{Status: http.StatusConflict, Code: "version_conflict", Message: "Resource changed; refresh before retrying"}
+	case errors.Is(err, proxyservice.ErrAssignmentConflict):
+		problem = httpx.Problem{Status: http.StatusConflict, Code: "proxy_assignment_conflict", Message: "The target is already assigned to another proxy"}
+	case errors.Is(err, accountservice.ErrIdentifierConflict):
+		problem = httpx.Problem{Status: http.StatusConflict, Code: "account_identifier_conflict", Message: err.Error()}
+	case errors.Is(err, proxyservice.ErrNameConflict):
+		problem = httpx.Problem{Status: http.StatusConflict, Code: "proxy_name_conflict", Message: err.Error()}
+	case errors.Is(err, browserinstanceservice.ErrNameConflict):
+		problem = httpx.Problem{Status: http.StatusConflict, Code: "instance_name_conflict", Message: err.Error()}
+	case errors.Is(err, profilesyncservice.ErrNameConflict):
+		problem = httpx.Problem{Status: http.StatusConflict, Code: "profile_name_conflict", Message: err.Error()}
+	case errors.Is(err, automationservice.ErrNameConflict):
+		problem = httpx.Problem{Status: http.StatusConflict, Code: "workflow_name_conflict", Message: err.Error()}
+	case errors.Is(err, scheduleservice.ErrInvalidCron):
+		problem = httpx.Problem{Status: http.StatusUnprocessableEntity, Code: "invalid_cron_expression", Message: err.Error()}
+	case errors.Is(err, scheduleservice.ErrInvalidTimezone):
+		problem = httpx.Problem{Status: http.StatusUnprocessableEntity, Code: "invalid_timezone", Message: err.Error()}
 	case errors.Is(err, proxyservice.ErrInUse):
 		problem = httpx.Problem{Status: http.StatusConflict, Code: "proxy_in_use", Message: "Proxy has active assignments"}
 	case errors.Is(err, proxyservice.ErrUnsupportedRoute), errors.Is(err, accountservice.ErrSecretRequired):
 		problem = httpx.Problem{Status: http.StatusUnprocessableEntity, Code: "validation_failed", Message: err.Error()}
 	case errors.Is(err, proxyservice.ErrSecretProvider), errors.Is(err, accountservice.ErrUnsupported):
 		problem = httpx.Problem{Status: http.StatusServiceUnavailable, Code: "service_unavailable", Message: "Required service is unavailable"}
+	case errors.Is(err, authservice.ErrMFALocked):
+		retryAfter := 60
+		var locked *authservice.MFALockedError
+		if errors.As(err, &locked) {
+			retryAfter = int(math.Ceil(time.Until(locked.Until).Seconds()))
+		}
+		if retryAfter < 1 {
+			retryAfter = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		problem = httpx.Problem{Status: http.StatusTooManyRequests, Code: "mfa_locked", Message: err.Error(), Details: map[string]int{"retryAfterSeconds": retryAfter}}
+	// Second-factor failures on signed-in routes are 422, never 401: a 401
+	// makes clients renew the access token and retry.
+	case errors.Is(err, authservice.ErrMFAInvalidCode):
+		problem = httpx.Problem{Status: http.StatusUnprocessableEntity, Code: "mfa_invalid_code", Message: err.Error()}
+	case errors.Is(err, authservice.ErrMFACodeRequired):
+		problem = httpx.Problem{Status: http.StatusUnprocessableEntity, Code: "mfa_code_required", Message: err.Error()}
+	case errors.Is(err, authservice.ErrInvalidPassword):
+		problem = httpx.Problem{Status: http.StatusUnprocessableEntity, Code: "invalid_password", Message: err.Error()}
+	case errors.Is(err, authservice.ErrMFAChallengeInvalid):
+		problem = httpx.Problem{Status: http.StatusUnauthorized, Code: "mfa_challenge_invalid", Message: err.Error()}
+	case errors.Is(err, authservice.ErrMFAAlreadyEnabled):
+		problem = httpx.Problem{Status: http.StatusConflict, Code: "mfa_already_enabled", Message: err.Error()}
+	case errors.Is(err, authservice.ErrMFANotEnabled):
+		problem = httpx.Problem{Status: http.StatusConflict, Code: "mfa_not_enabled", Message: err.Error()}
+	case errors.Is(err, authservice.ErrMFASetupRequired):
+		problem = httpx.Problem{Status: http.StatusConflict, Code: "mfa_setup_required", Message: err.Error()}
+	case errors.Is(err, authservice.ErrMFAUnavailable):
+		g.logger.ErrorContext(r.Context(), "mfa_unavailable", "request_id", httpx.RequestID(r.Context()), "error", err)
+		problem = httpx.Problem{Status: http.StatusServiceUnavailable, Code: "mfa_unavailable", Message: "Two-factor authentication is unavailable"}
 	case errors.Is(err, authservice.ErrInvalidCredentials):
 		problem = httpx.Problem{Status: http.StatusUnauthorized, Code: "invalid_credentials", Message: "Email or password is incorrect"}
 	case errors.Is(err, authservice.ErrEmailExists), errors.Is(err, workspaceservice.ErrMemberExists):
 		problem = httpx.Problem{Status: http.StatusConflict, Code: "resource_conflict", Message: err.Error()}
+	case errors.Is(err, workspaceservice.ErrLastOwner):
+		problem = httpx.Problem{Status: http.StatusConflict, Code: "last_owner", Message: "The workspace must retain at least one owner"}
+	case errors.Is(err, workspaceservice.ErrInvalidRole):
+		problem = httpx.Problem{Status: http.StatusUnprocessableEntity, Code: "invalid_role", Message: "Role must be admin, manager, operator, or viewer"}
 	case errors.Is(err, authservice.ErrNotFound), errors.Is(err, workspaceservice.ErrNotFound), errors.Is(err, deviceservice.ErrNotFound), errors.Is(err, browserinstanceservice.ErrNotFound):
 		problem = httpx.Problem{Status: http.StatusNotFound, Code: "not_found", Message: "Resource was not found"}
 	case errors.Is(err, workspaceservice.ErrForbidden):
@@ -804,6 +1014,12 @@ func (g *Gateway) writeServiceError(w http.ResponseWriter, r *http.Request, err 
 		problem = httpx.Problem{Status: http.StatusConflict, Code: "version_conflict", Message: "Fingerprint template version is stale"}
 	case errors.Is(err, fingerprintservice.ErrInUse):
 		problem = httpx.Problem{Status: http.StatusConflict, Code: "fingerprint_in_use", Message: err.Error()}
+	case errors.Is(err, fingerprintservice.ErrNameConflict):
+		problem = httpx.Problem{Status: http.StatusConflict, Code: "fingerprint_name_conflict", Message: err.Error()}
+	case errors.Is(err, fingerprintservice.ErrBatchTooLarge):
+		problem = httpx.Problem{Status: http.StatusRequestEntityTooLarge, Code: "fingerprint_batch_too_large", Message: err.Error(), Details: map[string]int{"maxItems": fingerprintservice.MaxBatchTemplates}}
+	case errors.Is(err, fingerprintservice.ErrEmptyBatch), errors.Is(err, fingerprintservice.ErrInvalidInput):
+		problem = httpx.Problem{Status: http.StatusUnprocessableEntity, Code: "fingerprint_validation_failed", Message: err.Error()}
 	case errors.Is(err, profilesyncservice.ErrNotFound):
 		problem = httpx.Problem{Status: http.StatusNotFound, Code: "not_found", Message: "Cloud profile resource was not found"}
 	case errors.Is(err, profilesyncservice.ErrVersionConflict):
@@ -814,10 +1030,16 @@ func (g *Gateway) writeServiceError(w http.ResponseWriter, r *http.Request, err 
 		problem = httpx.Problem{Status: http.StatusConflict, Code: "profile_lease_invalid", Message: err.Error()}
 	case errors.Is(err, profilesyncservice.ErrRevisionConflict):
 		problem = httpx.Problem{Status: http.StatusConflict, Code: "profile_revision_conflict", Message: err.Error()}
+	case errors.Is(err, profilesyncservice.ErrConflictUnresolved):
+		problem = httpx.Problem{Status: http.StatusConflict, Code: "profile_conflict_unresolved", Message: "Resolve the open profile synchronization conflict first"}
 	case errors.Is(err, profilesyncservice.ErrRevisionState):
 		problem = httpx.Problem{Status: http.StatusConflict, Code: "profile_revision_state", Message: err.Error()}
 	case errors.Is(err, profilesyncservice.ErrObjectUnavailable):
 		problem = httpx.Problem{Status: http.StatusUnprocessableEntity, Code: "profile_object_unavailable", Message: err.Error()}
+	case errors.Is(err, profilesyncservice.ErrStorageQuotaExceeded):
+		problem = httpx.Problem{Status: http.StatusPaymentRequired, Code: "quota_exceeded", Message: "The organization profile storage quota is exhausted or unavailable"}
+	case errors.Is(err, profilesyncservice.ErrDeviceScope):
+		problem = httpx.Problem{Status: http.StatusForbidden, Code: "profile_device_scope", Message: "Profile operation is outside the authenticated device scope"}
 	case errors.Is(err, automationservice.ErrNotFound):
 		problem = httpx.Problem{Status: http.StatusNotFound, Code: "not_found", Message: "Workflow was not found"}
 	case errors.Is(err, automationservice.ErrVersionConflict):
@@ -838,12 +1060,11 @@ func (g *Gateway) writeServiceError(w http.ResponseWriter, r *http.Request, err 
 	httpx.WriteError(w, r, problem)
 }
 
-func requestMetadata(r *http.Request) authservice.SessionMetadata {
-	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
-	if err != nil {
-		host = strings.TrimSpace(r.RemoteAddr)
-	}
-	return authservice.SessionMetadata{UserAgent: r.UserAgent(), IPAddress: host}
+// requestMetadata records the resolved client IP (see TrustedProxies) and user
+// agent for sessions and login security events. The IP is always a parsed
+// address or empty, never raw header text.
+func (g *Gateway) requestMetadata(r *http.Request) authservice.SessionMetadata {
+	return authservice.SessionMetadata{UserAgent: r.UserAgent(), IPAddress: g.clientIP(r)}
 }
 
 func mustPrincipal(ctx context.Context) principal {

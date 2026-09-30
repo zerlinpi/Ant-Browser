@@ -33,6 +33,10 @@ type Store struct {
 	sessions    map[string]authservice.Session
 	refresh     map[string]authservice.RefreshToken
 
+	mfaFactors       map[string]authservice.MFAFactor
+	mfaRecoveryCodes map[string][]memoryRecoveryCode
+	mfaChallenges    map[string]authservice.MFAChallenge
+
 	organizations    map[string]workspaceservice.Organization
 	workspaces       map[string]workspaceservice.Workspace
 	memberships      map[string]workspaceservice.Membership
@@ -92,12 +96,19 @@ type Store struct {
 	licenseByHash      map[string]string
 	releaseChannels    map[string]billingservice.ReleaseChannel
 	releaseByCode      map[string]string
+
+	// features holds per-feature state; see extensions.go. featuresMu guards
+	// the map itself; the state inside is guarded by mu.
+	featuresMu sync.Mutex
+	features   map[interface{}]interface{}
 }
 
 func New() *Store {
 	store := &Store{
 		users: make(map[string]authservice.User), userByEmail: make(map[string]string),
 		sessions: make(map[string]authservice.Session), refresh: make(map[string]authservice.RefreshToken),
+		mfaFactors: make(map[string]authservice.MFAFactor), mfaRecoveryCodes: make(map[string][]memoryRecoveryCode),
+		mfaChallenges: make(map[string]authservice.MFAChallenge),
 		organizations: make(map[string]workspaceservice.Organization), workspaces: make(map[string]workspaceservice.Workspace),
 		memberships: make(map[string]workspaceservice.Membership),
 		invitations: make(map[string]workspaceservice.Invitation), invitationHashes: make(map[string]string),
@@ -124,6 +135,7 @@ func New() *Store {
 		usageCounters: make(map[string]billingservice.UsageCounter), usageReservations: make(map[string]billingservice.UsageReservation), usageByIdempotency: make(map[string]string),
 		licenses: make(map[string]billingservice.LicenseActivation), licenseByHash: make(map[string]string),
 		releaseChannels: make(map[string]billingservice.ReleaseChannel), releaseByCode: make(map[string]string),
+		features: make(map[interface{}]interface{}),
 	}
 	// Keep local development useful out of the box while production seeds the
 	// same catalog through an explicitly trusted bootstrap operation.
@@ -289,6 +301,54 @@ func (s *Store) SessionActive(_ context.Context, userID, sessionID string) (bool
 	return userExists && user.Status == "active" && session.RevokedAt == nil && session.ExpiresAt.After(time.Now().UTC()), nil
 }
 
+func (s *Store) ListActiveSessions(_ context.Context, userID string, now time.Time, limit int) ([]authservice.Session, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	items := make([]authservice.Session, 0)
+	for _, session := range s.sessions {
+		if session.UserID == userID && session.RevokedAt == nil && session.ExpiresAt.After(now) {
+			items = append(items, session)
+		}
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if !items[i].LastSeenAt.Equal(items[j].LastSeenAt) {
+			return items[i].LastSeenAt.After(items[j].LastSeenAt)
+		}
+		return items[i].ID < items[j].ID
+	})
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	return items, nil
+}
+
+func (s *Store) RevokeOtherSessions(_ context.Context, userID, keepSessionID, reason string, now time.Time) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	revoked := make([]string, 0)
+	for id, session := range s.sessions {
+		if session.UserID != userID || id == keepSessionID || session.RevokedAt != nil || !session.ExpiresAt.After(now) {
+			continue
+		}
+		revokedAt := now
+		session.RevokedAt, session.RevokeReason = &revokedAt, reason
+		s.sessions[id] = session
+		revoked = append(revoked, id)
+	}
+	for hash, token := range s.refresh {
+		for _, id := range revoked {
+			if token.SessionID == id && token.RevokedAt == nil {
+				revokedAt := now
+				token.RevokedAt = &revokedAt
+				s.refresh[hash] = token
+				break
+			}
+		}
+	}
+	sort.Strings(revoked)
+	return revoked, nil
+}
+
 func (s *Store) CreateOrganizationWorkspace(_ context.Context, organization workspaceservice.Organization, workspace workspaceservice.Workspace, membership workspaceservice.Membership) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -298,9 +358,12 @@ func (s *Store) CreateOrganizationWorkspace(_ context.Context, organization work
 	if organization.Status == "" {
 		organization.Status = "active"
 	}
+	// Role is a per-caller projection and is never persisted (PostgreSQL has
+	// no such column).
+	workspace.Role = ""
 	s.organizations[organization.ID] = organization
 	s.workspaces[workspace.ID] = workspace
-	s.memberships[membershipKey(workspace.ID, membership.UserID)] = membership
+	s.memberships[membershipKey(workspace.ID, membership.UserID)] = storedMembership(membership)
 	s.provisionFreeBillingLocked(organization.ID, organization.CreatedAt)
 	return nil
 }
@@ -343,11 +406,14 @@ func (s *Store) ListWorkspaces(_ context.Context, userID string) ([]workspaceser
 		workspace, ok := s.workspaces[membership.WorkspaceID]
 		organization, organizationExists := s.organizations[workspace.OrganizationID]
 		if ok && workspace.DeletedAt == nil && workspace.Status == "active" && organizationExists && organization.Status != "suspended" && organization.Status != "deleted" {
+			workspace.Role = membership.Role
 			items = append(items, workspace)
 		}
 	}
 	sort.Slice(items, func(i, j int) bool {
-		if items[i].CreatedAt.Equal(items[j].CreatedAt) { return items[i].ID < items[j].ID }
+		if items[i].CreatedAt.Equal(items[j].CreatedAt) {
+			return items[i].ID < items[j].ID
+		}
 		return items[i].CreatedAt.Before(items[j].CreatedAt)
 	})
 	return items, nil
@@ -376,6 +442,7 @@ func (s *Store) UpdateWorkspace(_ context.Context, workspace workspaceservice.Wo
 		return workspaceservice.Workspace{}, workspaceservice.ErrVersionConflict
 	}
 	workspace.Version = current.Version + 1
+	workspace.Role = ""
 	s.workspaces[workspace.ID] = workspace
 	return workspace, nil
 }
@@ -440,13 +507,21 @@ func (s *Store) ListMembers(_ context.Context, workspaceID string) ([]workspaces
 	items := make([]workspaceservice.Membership, 0)
 	for _, membership := range s.memberships {
 		if membership.WorkspaceID == workspaceID && membership.Status == "active" {
-			items = append(items, membership)
+			items = append(items, s.memberWithProfileLocked(membership))
 		}
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].JoinedAt.Before(items[j].JoinedAt) })
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].JoinedAt.Equal(items[j].JoinedAt) {
+			return items[i].UserID < items[j].UserID
+		}
+		return items[i].JoinedAt.Before(items[j].JoinedAt)
+	})
 	return items, nil
 }
 
+// AddMember inserts a membership. A previously removed membership of the same
+// user is re-activated in place (matching PostgreSQL's upsert); an active or
+// invited one is a conflict.
 func (s *Store) AddMember(_ context.Context, membership workspaceservice.Membership) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -458,7 +533,7 @@ func (s *Store) AddMember(_ context.Context, membership workspaceservice.Members
 		return authservice.ErrNotFound
 	}
 	key := membershipKey(membership.WorkspaceID, membership.UserID)
-	if _, exists := s.memberships[key]; exists {
+	if existing, exists := s.memberships[key]; exists && existing.Status != "removed" {
 		return workspaceservice.ErrMemberExists
 	}
 	if membership.Status == "active" && !s.organizationHasMemberLocked(workspace.OrganizationID, membership.UserID) {
@@ -467,16 +542,18 @@ func (s *Store) AddMember(_ context.Context, membership workspaceservice.Members
 			return billingservice.ErrQuotaExceeded
 		}
 	}
-	s.memberships[key] = membership
+	s.memberships[key] = storedMembership(membership)
 	return nil
 }
 
+// UpdateMemberRole changes the role of an active membership. Demoting the last
+// active owner fails with ErrLastOwner.
 func (s *Store) UpdateMemberRole(_ context.Context, workspaceID, userID string, role memberservice.Role) (workspaceservice.Membership, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := membershipKey(workspaceID, userID)
 	membership, ok := s.memberships[key]
-	if !ok {
+	if !ok || membership.Status != "active" {
 		return workspaceservice.Membership{}, workspaceservice.ErrNotFound
 	}
 	if membership.Role == memberservice.RoleOwner && role != memberservice.RoleOwner && s.ownerCountLocked(workspaceID) <= 1 {
@@ -485,22 +562,63 @@ func (s *Store) UpdateMemberRole(_ context.Context, workspaceID, userID string, 
 	membership.Role = role
 	membership.UpdatedAt = time.Now().UTC()
 	s.memberships[key] = membership
-	return membership, nil
+	return s.memberWithProfileLocked(membership), nil
 }
 
-func (s *Store) RemoveMember(_ context.Context, workspaceID, userID string) error {
+// RemoveMember marks an active membership removed and, under the same lock,
+// revokes the member's devices and device credentials in the workspace so
+// their agents lose access together with the membership. The removed row is
+// kept (as in PostgreSQL, where notifications reference it); AddMember and
+// AcceptInvitation re-activate it.
+func (s *Store) RemoveMember(_ context.Context, workspaceID, userID string, now time.Time) (workspaceservice.MemberRemoval, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := membershipKey(workspaceID, userID)
 	membership, ok := s.memberships[key]
-	if !ok {
-		return workspaceservice.ErrNotFound
+	if !ok || membership.Status != "active" {
+		return workspaceservice.MemberRemoval{}, workspaceservice.ErrNotFound
 	}
 	if membership.Role == memberservice.RoleOwner && s.ownerCountLocked(workspaceID) <= 1 {
-		return workspaceservice.ErrLastOwner
+		return workspaceservice.MemberRemoval{}, workspaceservice.ErrLastOwner
 	}
-	delete(s.memberships, key)
-	return nil
+	membership.Status = "removed"
+	membership.UpdatedAt = now
+	s.memberships[key] = membership
+	revoked := make([]string, 0)
+	for id, device := range s.devices {
+		if device.WorkspaceID != workspaceID || device.UserID != userID {
+			continue
+		}
+		if device.RevokedAt == nil {
+			device.Status = "revoked"
+			device.RevokedAt = timePtr(now)
+			device.UpdatedAt = now
+			s.devices[id] = device
+			revoked = append(revoked, id)
+		}
+		if credential, exists := s.deviceCredentials[id]; exists && credential.RevokedAt == nil {
+			credential.RevokedAt = timePtr(now)
+			s.deviceCredentials[id] = credential
+		}
+	}
+	sort.Strings(revoked)
+	return workspaceservice.MemberRemoval{Membership: membership, RevokedDeviceIDs: revoked}, nil
+}
+
+// storedMembership drops response-only projections before persisting.
+func storedMembership(membership workspaceservice.Membership) workspaceservice.Membership {
+	membership.Email = ""
+	membership.DisplayName = ""
+	return membership
+}
+
+// memberWithProfileLocked adds the member's user email and display name.
+func (s *Store) memberWithProfileLocked(membership workspaceservice.Membership) workspaceservice.Membership {
+	if user, ok := s.users[membership.UserID]; ok {
+		membership.Email = user.Email
+		membership.DisplayName = user.DisplayName
+	}
+	return membership
 }
 
 func (s *Store) CreateInvitation(_ context.Context, invitation workspaceservice.Invitation, tokenHash string) error {
@@ -578,7 +696,8 @@ func (s *Store) AcceptInvitation(_ context.Context, workspaceID, tokenHash strin
 	if !ok || workspace.Status != "active" || workspace.DeletedAt != nil || organization.Status != "active" {
 		return workspaceservice.Membership{}, workspaceservice.ErrNotFound
 	}
-	if _, exists := s.memberships[membershipKey(workspaceID, membership.UserID)]; exists {
+	// A removed membership is re-activated by a valid invitation.
+	if existing, exists := s.memberships[membershipKey(workspaceID, membership.UserID)]; exists && existing.Status != "removed" {
 		return workspaceservice.Membership{}, workspaceservice.ErrMemberExists
 	}
 	if !s.organizationHasMemberLocked(workspace.OrganizationID, membership.UserID) {
@@ -588,6 +707,7 @@ func (s *Store) AcceptInvitation(_ context.Context, workspaceID, tokenHash strin
 		}
 	}
 	membership.Role = item.Role
+	membership = storedMembership(membership)
 	s.memberships[membershipKey(workspaceID, membership.UserID)] = membership
 	item.Status = "accepted"
 	item.AcceptedAt = &now
@@ -663,14 +783,37 @@ func (s *Store) RevokeDevice(_ context.Context, userID, deviceID string, now tim
 	if !ok || device.UserID != userID {
 		return deviceservice.ErrNotFound
 	}
+	// Keep the first revocation time, as PostgreSQL does with COALESCE.
 	device.Status = "revoked"
-	device.RevokedAt = &now
+	if device.RevokedAt == nil {
+		device.RevokedAt = timePtr(now)
+	}
 	device.UpdatedAt = now
 	s.devices[deviceID] = device
-	credential := s.deviceCredentials[deviceID]
-	credential.RevokedAt = &now
-	s.deviceCredentials[deviceID] = credential
+	if credential, exists := s.deviceCredentials[deviceID]; exists && credential.RevokedAt == nil {
+		credential.RevokedAt = timePtr(now)
+		s.deviceCredentials[deviceID] = credential
+	}
 	return nil
+}
+
+// RotateDeviceCredential replaces the device's credential under the store
+// lock. The memory adapter keeps only the current credential per device, so
+// replacing it revokes the previous secret immediately.
+func (s *Store) RotateDeviceCredential(_ context.Context, userID, deviceID string, credential deviceservice.Credential, _ time.Time) (deviceservice.Device, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	device, ok := s.devices[deviceID]
+	if !ok || device.UserID != userID {
+		return deviceservice.Device{}, deviceservice.ErrNotFound
+	}
+	if device.RevokedAt != nil {
+		return deviceservice.Device{}, deviceservice.ErrRevoked
+	}
+	credential.DeviceID = deviceID
+	credential.RevokedAt = nil
+	s.deviceCredentials[deviceID] = credential
+	return cloneDevice(device), nil
 }
 
 func (s *Store) AuthenticateDevice(_ context.Context, deviceID, credentialHash string) (deviceservice.Device, error) {
@@ -678,7 +821,8 @@ func (s *Store) AuthenticateDevice(_ context.Context, deviceID, credentialHash s
 	defer s.mu.RUnlock()
 	device, ok := s.devices[deviceID]
 	credential, credentialOK := s.deviceCredentials[deviceID]
-	if !ok || !credentialOK || credential.SecretHash != credentialHash || credential.RevokedAt != nil {
+	if !ok || !credentialOK || credential.SecretHash != credentialHash || credential.RevokedAt != nil ||
+		device.RevokedAt != nil || (credential.ExpiresAt != nil && !credential.ExpiresAt.After(time.Now())) {
 		return deviceservice.Device{}, deviceservice.ErrRevoked
 	}
 	return cloneDevice(device), nil
@@ -693,6 +837,9 @@ func (s *Store) CreateInstance(_ context.Context, instance browserinstanceservic
 	}
 	if err := s.validateInstanceReferencesLocked(instance); err != nil {
 		return err
+	}
+	if s.instanceNameTakenLocked(instance) {
+		return browserinstanceservice.ErrNameConflict
 	}
 	limit, allowed := s.activeEntitlementLimitLocked(workspace.OrganizationID, billingservice.EntitlementInstances)
 	if !allowed || (limit != nil && s.organizationInstanceCountLocked(workspace.OrganizationID)+1 > *limit) {
@@ -738,10 +885,24 @@ func (s *Store) UpdateInstance(_ context.Context, instance browserinstanceservic
 	if err := s.validateInstanceReferencesLocked(instance); err != nil {
 		return browserinstanceservice.BrowserInstance{}, err
 	}
+	if s.instanceNameTakenLocked(instance) {
+		return browserinstanceservice.BrowserInstance{}, browserinstanceservice.ErrNameConflict
+	}
 	instance.Version = current.Version + 1
 	instance.UpdatedAt = time.Now().UTC()
 	s.instances[instance.ID] = cloneInstance(instance)
 	return cloneInstance(instance), nil
+}
+
+// instanceNameTakenLocked mirrors browser_instances_live_name_uq: names are
+// unique per workspace among live instances, ignoring letter case.
+func (s *Store) instanceNameTakenLocked(instance browserinstanceservice.BrowserInstance) bool {
+	for id, existing := range s.instances {
+		if id != instance.ID && existing.WorkspaceID == instance.WorkspaceID && existing.DeletedAt == nil && strings.EqualFold(existing.Name, instance.Name) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) validateInstanceReferencesLocked(instance browserinstanceservice.BrowserInstance) error {
@@ -767,9 +928,16 @@ func (s *Store) validateInstanceReferencesLocked(instance browserinstanceservice
 		}
 	}
 	if instance.ProxyAssignmentID != "" {
-		assignment, ok := s.proxyAssignments[instance.ProxyAssignmentID]
-		if !ok || assignment.WorkspaceID != instance.WorkspaceID || assignment.DeletedAt != nil {
-			return proxyservice.ErrAssignmentConflict
+		// Assignments are keyed by target; the instance references one by ID.
+		found := false
+		for _, assignment := range s.proxyAssignments {
+			if assignment.ID == instance.ProxyAssignmentID && assignment.WorkspaceID == instance.WorkspaceID && assignment.DeletedAt == nil {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return proxyservice.ErrNotFound
 		}
 	}
 	return nil
@@ -860,7 +1028,9 @@ func (s *Store) ListPendingCommands(_ context.Context, workspaceID, deviceID str
 		}
 	}
 	sort.Slice(items, func(i, j int) bool {
-		if items[i].CreatedAt.Equal(items[j].CreatedAt) { return items[i].ID < items[j].ID }
+		if items[i].CreatedAt.Equal(items[j].CreatedAt) {
+			return items[i].ID < items[j].ID
+		}
 		return items[i].CreatedAt.Before(items[j].CreatedAt)
 	})
 	if len(items) > 100 {
@@ -902,11 +1072,24 @@ func (s *Store) TransitionCommand(_ context.Context, workspaceID, deviceID, comm
 			instance.DesiredState != "migrating" || instance.AssignedDeviceID != command.DeviceID {
 			return browserinstanceservice.Command{}, browserinstanceservice.ErrStateConflict
 		}
+		followUpKey := commandKey(workspaceID, browserinstanceservice.MigrationStartIdempotencyKey(command.ID))
+		if _, exists := s.commandIdempotency[followUpKey]; exists {
+			return browserinstanceservice.Command{}, browserinstanceservice.ErrIdempotencyConflict
+		}
 		instance.AssignedDeviceID = target
 		instance.DesiredState = "running"
 		instance.Version++
 		instance.UpdatedAt = now
 		s.instances[instance.ID] = cloneInstance(instance)
+		followUp := browserinstanceservice.Command{
+			ID: uuid.NewString(), WorkspaceID: workspaceID, InstanceID: instance.ID,
+			DeviceID: target, Action: "instance.start",
+			IdempotencyKey:  browserinstanceservice.MigrationStartIdempotencyKey(command.ID),
+			ExpectedVersion: instance.Version, Status: "pending", Payload: map[string]interface{}{},
+			Deadline: now.Add(2 * time.Minute), CreatedBy: command.CreatedBy, CreatedAt: now,
+		}
+		s.commands[followUp.ID] = followUp
+		s.commandIdempotency[followUpKey] = followUp.ID
 	}
 	s.commands[commandID] = command
 	return command, nil
@@ -927,18 +1110,35 @@ func (s *Store) UpdateObservedState(_ context.Context, workspaceID, deviceID, in
 	return cloneInstance(instance), nil
 }
 
-func (s *Store) CreateFingerprintTemplate(_ context.Context, template fingerprintservice.Template) error {
+func (s *Store) CreateFingerprintTemplate(ctx context.Context, template fingerprintservice.Template) error {
+	return s.CreateFingerprintTemplates(ctx, []fingerprintservice.Template{template})
+}
+
+func (s *Store) CreateFingerprintTemplates(_ context.Context, templates []fingerprintservice.Template) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.workspaces[template.WorkspaceID]; !ok {
-		return fingerprintservice.ErrNotFound
-	}
-	for _, existing := range s.fingerprintTemplates {
-		if existing.WorkspaceID == template.WorkspaceID && existing.DeletedAt == nil && strings.EqualFold(existing.Name, template.Name) {
-			return errors.New("fingerprint template name already exists")
+	names := make(map[string]struct{}, len(templates))
+	for _, template := range templates {
+		if _, ok := s.workspaces[template.WorkspaceID]; !ok {
+			return fingerprintservice.ErrNotFound
+		}
+		if _, exists := s.fingerprintTemplates[template.ID]; exists {
+			return fingerprintservice.ErrNameConflict
+		}
+		nameKey := template.WorkspaceID + "\x00" + strings.ToLower(template.Name)
+		if _, duplicate := names[nameKey]; duplicate {
+			return fingerprintservice.ErrNameConflict
+		}
+		names[nameKey] = struct{}{}
+		for _, existing := range s.fingerprintTemplates {
+			if existing.WorkspaceID == template.WorkspaceID && existing.DeletedAt == nil && strings.EqualFold(existing.Name, template.Name) {
+				return fingerprintservice.ErrNameConflict
+			}
 		}
 	}
-	s.fingerprintTemplates[template.ID] = cloneFingerprintTemplate(template)
+	for _, template := range templates {
+		s.fingerprintTemplates[template.ID] = cloneFingerprintTemplate(template)
+	}
 	return nil
 }
 
@@ -977,7 +1177,7 @@ func (s *Store) UpdateFingerprintTemplate(_ context.Context, template fingerprin
 	}
 	for id, existing := range s.fingerprintTemplates {
 		if id != template.ID && existing.WorkspaceID == template.WorkspaceID && existing.DeletedAt == nil && strings.EqualFold(existing.Name, template.Name) {
-			return fingerprintservice.Template{}, errors.New("fingerprint template name already exists")
+			return fingerprintservice.Template{}, fingerprintservice.ErrNameConflict
 		}
 	}
 	template.Version = current.Version + 1
@@ -1017,7 +1217,7 @@ func (s *Store) CreateProxy(_ context.Context, proxy proxyservice.Proxy) error {
 	}
 	for _, existing := range s.proxies {
 		if existing.WorkspaceID == proxy.WorkspaceID && existing.DeletedAt == nil && strings.EqualFold(existing.Name, proxy.Name) {
-			return errors.New("proxy name already exists")
+			return proxyservice.ErrNameConflict
 		}
 	}
 	s.proxies[proxy.ID] = proxy
@@ -1059,7 +1259,7 @@ func (s *Store) UpdateProxy(_ context.Context, proxy proxyservice.Proxy, expecte
 	}
 	for id, existing := range s.proxies {
 		if id != proxy.ID && existing.WorkspaceID == proxy.WorkspaceID && existing.DeletedAt == nil && strings.EqualFold(existing.Name, proxy.Name) {
-			return proxyservice.Proxy{}, errors.New("proxy name already exists")
+			return proxyservice.Proxy{}, proxyservice.ErrNameConflict
 		}
 	}
 	proxy.Version = current.Version + 1
@@ -1137,7 +1337,35 @@ func (s *Store) FindProxyAssignment(_ context.Context, workspaceID, targetID, ta
 	if !ok || assignment.DeletedAt != nil {
 		return proxyservice.Assignment{}, proxyservice.ErrNotFound
 	}
-	return assignment, nil
+	return s.namedAssignmentLocked(assignment), nil
+}
+
+func (s *Store) ListProxyAssignments(_ context.Context, workspaceID string, filter proxyservice.AssignmentFilter) ([]proxyservice.Assignment, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	items := make([]proxyservice.Assignment, 0)
+	for _, assignment := range s.proxyAssignments {
+		if assignment.WorkspaceID != workspaceID || assignment.DeletedAt != nil ||
+			(filter.ProxyID != "" && assignment.ProxyID != filter.ProxyID) ||
+			(filter.TargetType != "" && assignment.TargetType != filter.TargetType) {
+			continue
+		}
+		items = append(items, s.namedAssignmentLocked(assignment))
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if !items[i].CreatedAt.Equal(items[j].CreatedAt) {
+			return items[i].CreatedAt.Before(items[j].CreatedAt)
+		}
+		return items[i].ID < items[j].ID
+	})
+	return items, nil
+}
+
+func (s *Store) namedAssignmentLocked(assignment proxyservice.Assignment) proxyservice.Assignment {
+	if proxy, ok := s.proxies[assignment.ProxyID]; ok && proxy.WorkspaceID == assignment.WorkspaceID {
+		assignment.ProxyName = proxy.Name
+	}
+	return assignment
 }
 
 func (s *Store) DeleteProxyAssignment(_ context.Context, workspaceID, targetID, targetType string, expectedVersion int64, now time.Time) error {
@@ -1236,7 +1464,7 @@ func (s *Store) CreateCloudProfile(_ context.Context, profile profilesyncservice
 	}
 	for _, existing := range s.cloudProfiles {
 		if existing.WorkspaceID == profile.WorkspaceID && existing.DeletedAt == nil && strings.EqualFold(existing.Name, profile.Name) {
-			return errors.New("cloud profile name already exists")
+			return profilesyncservice.ErrNameConflict
 		}
 	}
 	s.cloudProfiles[profile.ID] = cloneCloudProfile(profile)
@@ -1266,7 +1494,7 @@ func (s *Store) ListCloudProfiles(_ context.Context, workspaceID string) ([]prof
 	return items, nil
 }
 
-func (s *Store) AcquireProfileLease(_ context.Context, lease profilesyncservice.Lease, hash string, now time.Time) error {
+func (s *Store) AcquireProfileLease(_ context.Context, lease profilesyncservice.Lease, hash string, reclaimOwn bool, now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	profile, ok := s.cloudProfiles[lease.ProfileID]
@@ -1277,8 +1505,12 @@ func (s *Store) AcquireProfileLease(_ context.Context, lease profilesyncservice.
 	if !ok || device.WorkspaceID != lease.WorkspaceID || device.RevokedAt != nil {
 		return deviceservice.ErrNotFound
 	}
+	if s.openProfileConflictLocked(lease.ProfileID) {
+		return profilesyncservice.ErrConflictUnresolved
+	}
 	if active, ok := s.profileLeases[lease.ProfileID]; ok {
-		if active.lease.ReleasedAt == nil && active.lease.ExpiresAt.After(now) {
+		if active.lease.ReleasedAt == nil && active.lease.ExpiresAt.After(now) &&
+			(!reclaimOwn || active.lease.HolderDeviceID != lease.HolderDeviceID) {
 			return profilesyncservice.ErrLeaseHeld
 		}
 	}
@@ -1351,6 +1583,9 @@ func (s *Store) BeginProfileRevision(
 	}
 	if !s.validProfileLeaseLocked(revision.ProfileID, revision.DeviceID, leaseHash, now) {
 		return profilesyncservice.Revision{}, profilesyncservice.Profile{}, nil, profilesyncservice.ErrLeaseInvalid
+	}
+	if s.openProfileConflictLocked(revision.ProfileID) {
+		return profilesyncservice.Revision{}, profilesyncservice.Profile{}, nil, profilesyncservice.ErrConflictUnresolved
 	}
 	if profile.CurrentRevisionID == "" && revision.BaseRevisionID != "" {
 		return profilesyncservice.Revision{}, profilesyncservice.Profile{}, nil, profilesyncservice.ErrRevisionConflict
@@ -1611,38 +1846,91 @@ func (s *Store) ListProfileConflicts(_ context.Context, workspaceID, profileID s
 	return items, nil
 }
 
+func (s *Store) LoadProfileConflictPlan(_ context.Context, workspaceID, profileID, conflictID string) (profilesyncservice.Conflict, profilesyncservice.RevisionPlan, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	profile, ok := s.cloudProfiles[profileID]
+	conflict, conflictOK := s.profileConflicts[conflictID]
+	if !ok || profile.WorkspaceID != workspaceID || profile.DeletedAt != nil || !conflictOK || conflict.ProfileID != profileID {
+		return profilesyncservice.Conflict{}, profilesyncservice.RevisionPlan{}, profilesyncservice.ErrNotFound
+	}
+	revision, ok := s.profileRevisions[conflict.LocalRevisionID]
+	if !ok || revision.ProfileID != profileID {
+		return profilesyncservice.Conflict{}, profilesyncservice.RevisionPlan{}, profilesyncservice.ErrNotFound
+	}
+	return conflict, profilesyncservice.RevisionPlan{
+		Revision: revision, Manifest: cloneProfileManifest(s.profileManifests[revision.ID]),
+		Objects: cloneProfileObjects(s.profileObjects[revision.ID]),
+	}, nil
+}
+
+// ResolveProfileConflict mirrors the PostgreSQL implementation: keep_local
+// promotes the uploaded local snapshot (the service verified its objects)
+// while no other device holds a lease; keep_remote discards the local
+// revision. Either way the profile stays in conflict while other conflicts
+// remain open.
 func (s *Store) ResolveProfileConflict(_ context.Context, workspaceID, profileID, conflictID, resolution, actorID string, now time.Time) (profilesyncservice.Conflict, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	profile, ok := s.cloudProfiles[profileID]
 	conflict, conflictOK := s.profileConflicts[conflictID]
-	if !ok || profile.WorkspaceID != workspaceID || !conflictOK || conflict.ProfileID != profileID {
+	if !ok || profile.WorkspaceID != workspaceID || profile.DeletedAt != nil || !conflictOK || conflict.ProfileID != profileID {
 		return profilesyncservice.Conflict{}, profilesyncservice.ErrNotFound
 	}
 	if conflict.Status != "open" {
 		return profilesyncservice.Conflict{}, profilesyncservice.ErrRevisionState
 	}
-	local := s.profileRevisions[conflict.LocalRevisionID]
+	local, localOK := s.profileRevisions[conflict.LocalRevisionID]
 	switch resolution {
 	case "keep_local":
-		local.BaseRevisionID = conflict.RemoteRevisionID
-		profile.Status = "syncing"
+		if !localOK || local.Status != "uploading" || s.profileManifests[local.ID].Mode != "snapshot" ||
+			profile.CurrentRevisionID != conflict.RemoteRevisionID {
+			return profilesyncservice.Conflict{}, profilesyncservice.ErrRevisionState
+		}
+		if record, leased := s.profileLeases[profileID]; leased && record.lease.ReleasedAt == nil && record.lease.ExpiresAt.After(now) {
+			return profilesyncservice.Conflict{}, profilesyncservice.ErrLeaseHeld
+		}
+		if err := s.applyProfileStorageQuotaLocked(workspaceID, profileID, local.ID, local.BaseRevisionID, now); err != nil {
+			return profilesyncservice.Conflict{}, err
+		}
+		if remote, exists := s.profileRevisions[conflict.RemoteRevisionID]; exists && remote.Status == "committed" {
+			remote.Status = "superseded"
+			s.profileRevisions[remote.ID] = remote
+		}
+		local.Status = "committed"
+		local.CommittedAt = &now
+		s.profileRevisions[local.ID] = local
+		profile.CurrentRevisionID = local.ID
 	case "keep_remote":
-		local.Status = "superseded"
-		profile.Status = "active"
+		if localOK && local.Status == "uploading" {
+			local.Status = "superseded"
+			s.profileRevisions[local.ID] = local
+		}
 	default:
 		return profilesyncservice.Conflict{}, profilesyncservice.ErrRevisionState
 	}
-	s.profileRevisions[local.ID] = local
 	conflict.Status = "resolved"
 	conflict.Resolution = resolution
 	conflict.ResolvedBy = actorID
 	conflict.ResolvedAt = &now
 	s.profileConflicts[conflict.ID] = conflict
+	profile.Status = "active"
+	if s.openProfileConflictLocked(profileID) {
+		profile.Status = "conflict"
+	}
 	profile.UpdatedAt = now
 	profile.Version++
 	s.cloudProfiles[profile.ID] = profile
 	return conflict, nil
+}
+
+func (s *Store) openProfileConflictLocked(profileID string) bool {
+	for _, id := range s.profileConflictIDs[profileID] {
+		if s.profileConflicts[id].Status == "open" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) validProfileLeaseLocked(profileID, deviceID, hash string, now time.Time) bool {
@@ -2098,6 +2386,19 @@ func cloneLease(value taskservice.Lease) taskservice.Lease {
 
 func cloneFingerprintTemplate(value fingerprintservice.Template) fingerprintservice.Template {
 	value.RuntimeArgs = append([]string(nil), value.RuntimeArgs...)
+	value.Configuration.Fonts = append([]string(nil), value.Configuration.Fonts...)
+	if value.Configuration.MaxTouchPoints != nil {
+		copyValue := *value.Configuration.MaxTouchPoints
+		value.Configuration.MaxTouchPoints = &copyValue
+	}
+	if value.Configuration.MediaDevices != nil {
+		copyValue := *value.Configuration.MediaDevices
+		value.Configuration.MediaDevices = &copyValue
+	}
+	if value.Configuration.Battery != nil {
+		copyValue := *value.Configuration.Battery
+		value.Configuration.Battery = &copyValue
+	}
 	return value
 }
 

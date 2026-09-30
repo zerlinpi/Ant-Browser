@@ -12,7 +12,10 @@ func (a *App) startBrowserProfileWithPlan(input browserStartInput, plan *browser
 	log := logger.New("Browser")
 	profile := plan.profile
 	a.clearDeferredStartTargets(input.ProfileID)
-	a.markProfileLastLaunchArgsLocked(profile, plan.args)
+	// Launch provenance is recorded only once the new process is running and
+	// tracked (see markProfileLastLaunchArgsLocked below), so every failure
+	// path of this launch leaves the profile without provenance.
+	clearProfileLaunchProvenanceLocked(profile)
 
 	cmd := exec.Command(plan.chromeBinaryPath, plan.args...)
 	cmd.Dir = filepath.Dir(plan.chromeBinaryPath)
@@ -66,6 +69,7 @@ func (a *App) startBrowserProfileWithPlan(input browserStartInput, plan *browser
 		stableDebugPort, readyErr := waitBrowserDebugPortStable(plan.assignedDebugPort, plan.userDataDir, plan.startReadyTimeout, plan.startStableWindow, monitor)
 		if readyErr == nil {
 			a.markProfileRunningLocked(input.ProfileID, profile, cmd, cmd.Process.Pid, stableDebugPort, true, "")
+			a.markProfileLastLaunchArgsLocked(profile, plan.args)
 			if plan.acquiredProxyBridge.valid() {
 				a.bindProfileProxyBridge(input.ProfileID, plan.acquiredProxyBridge)
 				plan.releaseProxyBridge = false
@@ -143,6 +147,9 @@ func (a *App) startBrowserProfileWithPlan(input browserStartInput, plan *browser
 		runtimeWarning := browserDebugPendingWarning(plan.totalReadyTimeout)
 		pendingStartNotice = browserDebugPendingStartNotice(plan.totalReadyTimeout)
 		a.markProfileRunningLocked(input.ProfileID, profile, cmd, cmd.Process.Pid, plan.assignedDebugPort, false, runtimeWarning)
+		// The process is alive and tracked while its debug port attaches in the
+		// background, so it keeps provenance until the monitor marks it stopped.
+		a.markProfileLastLaunchArgsLocked(profile, plan.args)
 		if len(plan.deferredStartTargets) > 0 {
 			a.storeDeferredStartTargets(input.ProfileID, plan.deferredStartTargets, plan.deferredStartNewTabs)
 		}

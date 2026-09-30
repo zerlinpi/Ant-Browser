@@ -87,31 +87,32 @@ func TestMigrationsAgainstPostgres(t *testing.T) {
 // transactions to catch session-setting leakage.
 func testRLSTenantIsolation(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	t.Helper()
-	var workspaceA, workspaceB string
-	if err := pool.QueryRow(ctx, `
-		WITH a AS (
-			INSERT INTO users(email,password_hash) VALUES(gen_random_uuid()::text || '@rls-a.test','test') RETURNING id
-		), ao AS (
-			INSERT INTO organizations(name,slug,owner_user_id) SELECT 'RLS A',gen_random_uuid()::text,id FROM a RETURNING id,owner_user_id
-		), aw AS (
-			INSERT INTO workspaces(organization_id,name,slug,created_by) SELECT id,'RLS A',gen_random_uuid()::text,owner_user_id FROM ao RETURNING id,created_by
-		) INSERT INTO workspace_members(workspace_id,user_id,role_id) SELECT aw.id,aw.created_by,r.id FROM aw CROSS JOIN roles r WHERE r.code='owner' RETURNING workspace_id::text
-	`).Scan(&workspaceA); err != nil {
-		t.Fatal(err)
+	createWorkspace := func(label string) string {
+		var workspaceID, ownerID string
+		if err := pool.QueryRow(ctx, `
+			WITH a AS (
+				INSERT INTO users(email,password_hash) VALUES(gen_random_uuid()::text || '@rls-' || $1::text || '.test','test') RETURNING id
+			), ao AS (
+				INSERT INTO organizations(name,slug,owner_user_id) SELECT 'RLS ' || $1::text,gen_random_uuid()::text,id FROM a RETURNING id,owner_user_id
+			) INSERT INTO workspaces(organization_id,name,slug,created_by) SELECT id,'RLS ' || $1::text,gen_random_uuid()::text,owner_user_id FROM ao RETURNING id::text, created_by::text
+		`, label).Scan(&workspaceID, &ownerID); err != nil {
+			t.Fatal(err)
+		}
+		// The membership needs its own statement: the organization's AFTER
+		// INSERT trigger provisions Free-plan entitlements only when the
+		// statement above ends, and the team-member quota trigger (023)
+		// rejects memberships of organizations without them.
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO workspace_members(workspace_id,user_id,role_id)
+			SELECT $1::uuid, $2::uuid, r.id FROM roles r WHERE r.code='owner'
+		`, workspaceID, ownerID); err != nil {
+			t.Fatal(err)
+		}
+		return workspaceID
 	}
-	if err := pool.QueryRow(ctx, `
-		WITH a AS (
-			INSERT INTO users(email,password_hash) VALUES(gen_random_uuid()::text || '@rls-b.test','test') RETURNING id
-		), ao AS (
-			INSERT INTO organizations(name,slug,owner_user_id) SELECT 'RLS B',gen_random_uuid()::text,id FROM a RETURNING id,owner_user_id
-		), aw AS (
-			INSERT INTO workspaces(organization_id,name,slug,created_by) SELECT id,'RLS B',gen_random_uuid()::text,owner_user_id FROM ao RETURNING id,created_by
-		) INSERT INTO workspace_members(workspace_id,user_id,role_id) SELECT aw.id,aw.created_by,r.id FROM aw CROSS JOIN roles r WHERE r.code='owner' RETURNING workspace_id::text
-	`).Scan(&workspaceB); err != nil {
-		t.Fatal(err)
-	}
+	workspaceA, workspaceB := createWorkspace("a"), createWorkspace("b")
 	for _, workspaceID := range []string{workspaceA, workspaceB} {
-		if _, err := pool.Exec(ctx, `INSERT INTO devices(workspace_id,name,platform,agent_version,capabilities,status) VALUES($1::uuid,'rls-device','linux','test','{}','offline')`, workspaceID); err != nil {
+		if _, err := pool.Exec(ctx, `INSERT INTO devices(workspace_id,device_key,name,platform,agent_version,capabilities,status) VALUES($1::uuid,gen_random_uuid()::text,'rls-device','linux','test','{}','offline')`, workspaceID); err != nil {
 			t.Fatal(err)
 		}
 	}

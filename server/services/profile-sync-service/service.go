@@ -24,6 +24,14 @@ var (
 	ErrRevisionConflict  = errors.New("profile revision conflicts with the current cloud revision")
 	ErrRevisionState     = errors.New("profile revision state conflict")
 	ErrObjectUnavailable = errors.New("profile object is unavailable or does not match its metadata")
+	ErrDeviceScope       = errors.New("profile operation is outside the authenticated device scope")
+	// ErrConflictUnresolved blocks new leases and revisions while a profile
+	// has an open conflict, so no device can pull, push or restore state that
+	// a pending keep-local/keep-remote decision would contradict.
+	ErrConflictUnresolved = errors.New("profile has an unresolved synchronization conflict")
+	// ErrNameConflict: cloud profile names are unique per workspace among
+	// live profiles, compared case-insensitively.
+	ErrNameConflict = errors.New("cloud profile name already exists")
 	// ErrStorageQuotaExceeded is returned when the organization's current
 	// profile footprint would exceed its storage_bytes entitlement. Storage is
 	// tracked separately from period-based billing usage because replacing a
@@ -139,7 +147,11 @@ type Repository interface {
 	CreateCloudProfile(context.Context, Profile) error
 	FindCloudProfile(context.Context, string, string) (Profile, error)
 	ListCloudProfiles(context.Context, string) ([]Profile, error)
-	AcquireProfileLease(context.Context, Lease, string, time.Time) error
+	// AcquireProfileLease grants lease unless another holder has an active
+	// lease or the profile has an open conflict. With reclaimOwn, an active
+	// lease already held by the same device is released and replaced, so a
+	// device that crashed mid-sync does not wait for its own lease to expire.
+	AcquireProfileLease(ctx context.Context, lease Lease, tokenHash string, reclaimOwn bool, now time.Time) error
 	ValidateProfileLease(context.Context, string, string, string, string, time.Time) error
 	RenewProfileLease(context.Context, string, string, string, string, time.Time, time.Time) (Lease, error)
 	ReleaseProfileLease(context.Context, string, string, string, string, time.Time) error
@@ -150,7 +162,13 @@ type Repository interface {
 	RestoreProfileRevision(context.Context, string, string, string, string, string, string, time.Time) (Profile, Revision, error)
 	ListProfileRevisions(context.Context, string, string) ([]Revision, error)
 	ListProfileConflicts(context.Context, string, string) ([]Conflict, error)
-	ResolveProfileConflict(context.Context, string, string, string, string, string, time.Time) (Conflict, error)
+	// LoadProfileConflictPlan returns a conflict with the plan (manifest and
+	// objects) of its local revision, whatever that revision's status.
+	LoadProfileConflictPlan(ctx context.Context, workspaceID, profileID, conflictID string) (Conflict, RevisionPlan, error)
+	// ResolveProfileConflict applies a resolution atomically. keep_local
+	// promotes the local snapshot revision to current (its objects must have
+	// been verified by the caller); keep_remote discards the local revision.
+	ResolveProfileConflict(ctx context.Context, workspaceID, profileID, conflictID, resolution, actorID string, now time.Time) (Conflict, error)
 }
 
 type Authorizer interface {
@@ -279,6 +297,9 @@ func (s *Service) AcquireLease(ctx context.Context, actorID, workspaceID, profil
 	if err := s.authorizer.Require(ctx, workspaceID, actorID, memberservice.PermissionProfileSync); err != nil {
 		return LeaseGrant{}, err
 	}
+	if err := requireAuthorizedDevice(ctx, input.DeviceID); err != nil {
+		return LeaseGrant{}, err
+	}
 	deviceID := strings.TrimSpace(input.DeviceID)
 	if deviceID == "" {
 		return LeaseGrant{}, errors.New("deviceId is required")
@@ -299,7 +320,11 @@ func (s *Service) AcquireLease(ctx context.Context, actorID, workspaceID, profil
 		ID: uuid.NewString(), WorkspaceID: workspaceID, ProfileID: profileID,
 		HolderDeviceID: deviceID, AcquiredAt: now, ExpiresAt: now.Add(ttl),
 	}
-	if err := s.repository.AcquireProfileLease(ctx, lease, hash, now); err != nil {
+	// Only the device itself may replace its own active lease (for example
+	// after crashing mid-sync). A workspace user naming a device ID must wait
+	// for expiry, so it cannot preempt that device's in-flight transfer.
+	reclaimOwn := memberservice.AuthorizedDeviceID(ctx) == deviceID
+	if err := s.repository.AcquireProfileLease(ctx, lease, hash, reclaimOwn, now); err != nil {
 		return LeaseGrant{}, err
 	}
 	return LeaseGrant{Lease: lease, Token: raw}, nil
@@ -307,6 +332,9 @@ func (s *Service) AcquireLease(ctx context.Context, actorID, workspaceID, profil
 
 func (s *Service) RenewLease(ctx context.Context, actorID, workspaceID, profileID string, input LeaseTokenInput, ttl time.Duration) (Lease, error) {
 	if err := s.authorizer.Require(ctx, workspaceID, actorID, memberservice.PermissionProfileSync); err != nil {
+		return Lease{}, err
+	}
+	if err := requireAuthorizedDevice(ctx, input.DeviceID); err != nil {
 		return Lease{}, err
 	}
 	if ttl < time.Minute || ttl > 30*time.Minute {
@@ -322,6 +350,9 @@ func (s *Service) ReleaseLease(ctx context.Context, actorID, workspaceID, profil
 	if err := s.authorizer.Require(ctx, workspaceID, actorID, memberservice.PermissionProfileSync); err != nil {
 		return err
 	}
+	if err := requireAuthorizedDevice(ctx, input.DeviceID); err != nil {
+		return err
+	}
 	return s.repository.ReleaseProfileLease(
 		ctx, workspaceID, profileID, strings.TrimSpace(input.DeviceID), tokenHash(input.Token), s.now().UTC(),
 	)
@@ -329,6 +360,9 @@ func (s *Service) ReleaseLease(ctx context.Context, actorID, workspaceID, profil
 
 func (s *Service) BeginRevision(ctx context.Context, actorID, workspaceID, profileID string, input BeginRevisionInput) (RevisionPlan, error) {
 	if err := s.authorizer.Require(ctx, workspaceID, actorID, memberservice.PermissionProfileSync); err != nil {
+		return RevisionPlan{}, err
+	}
+	if err := requireAuthorizedDevice(ctx, input.DeviceID); err != nil {
 		return RevisionPlan{}, err
 	}
 	if s.encryptionKeyRef == "" || s.storageBackend == "" {
@@ -371,6 +405,9 @@ func (s *Service) CommitRevision(ctx context.Context, actorID, workspaceID, prof
 	if err := s.authorizer.Require(ctx, workspaceID, actorID, memberservice.PermissionProfileSync); err != nil {
 		return Profile{}, Revision{}, err
 	}
+	if err := requireAuthorizedDevice(ctx, input.DeviceID); err != nil {
+		return Profile{}, Revision{}, err
+	}
 	if s.objectStorage == nil {
 		return Profile{}, Revision{}, errors.New("profile object storage is not configured")
 	}
@@ -394,6 +431,9 @@ func (s *Service) CommitRevision(ctx context.Context, actorID, workspaceID, prof
 
 func (s *Service) PrepareObjectUpload(ctx context.Context, actorID, workspaceID, profileID, revisionID, objectID string, input LeaseTokenInput) (UploadGrant, error) {
 	if err := s.authorizer.Require(ctx, workspaceID, actorID, memberservice.PermissionProfileSync); err != nil {
+		return UploadGrant{}, err
+	}
+	if err := requireAuthorizedDevice(ctx, input.DeviceID); err != nil {
 		return UploadGrant{}, err
 	}
 	if s.objectStorage == nil {
@@ -471,6 +511,9 @@ func (s *Service) RestoreRevision(ctx context.Context, actorID, workspaceID, pro
 	if err := s.authorizer.Require(ctx, workspaceID, actorID, memberservice.PermissionProfileSync); err != nil {
 		return Profile{}, Revision{}, err
 	}
+	if err := requireAuthorizedDevice(ctx, input.DeviceID); err != nil {
+		return Profile{}, Revision{}, err
+	}
 	if s.objectStorage == nil {
 		return Profile{}, Revision{}, errors.New("profile object storage is not configured")
 	}
@@ -494,6 +537,14 @@ func (s *Service) RestoreRevision(ctx context.Context, actorID, workspaceID, pro
 	)
 }
 
+func requireAuthorizedDevice(ctx context.Context, requestedDeviceID string) error {
+	authorizedDeviceID := memberservice.AuthorizedDeviceID(ctx)
+	if authorizedDeviceID != "" && strings.TrimSpace(requestedDeviceID) != authorizedDeviceID {
+		return ErrDeviceScope
+	}
+	return nil
+}
+
 func (s *Service) Revisions(ctx context.Context, actorID, workspaceID, profileID string) ([]Revision, error) {
 	if err := s.authorizer.Require(ctx, workspaceID, actorID, memberservice.PermissionProfileRead); err != nil {
 		return nil, err
@@ -515,6 +566,27 @@ func (s *Service) ResolveConflict(ctx context.Context, actorID, workspaceID, pro
 	resolution := strings.ToLower(strings.TrimSpace(input.Resolution))
 	if resolution != "keep_local" && resolution != "keep_remote" {
 		return Conflict{}, errors.New("resolution must be keep_local or keep_remote")
+	}
+	if resolution == "keep_local" {
+		// Promoting the local revision makes it the state every device
+		// restores, so each of its objects must exist and match before the
+		// conflict is resolved; an interrupted upload stays resolvable only
+		// as keep_remote.
+		if s.objectStorage == nil {
+			return Conflict{}, errors.New("profile object storage is not configured")
+		}
+		conflict, plan, err := s.repository.LoadProfileConflictPlan(ctx, workspaceID, profileID, conflictID)
+		if err != nil {
+			return Conflict{}, err
+		}
+		if conflict.Status != "open" || plan.Revision.Status != "uploading" || plan.Manifest.Mode != "snapshot" || len(plan.Objects) == 0 {
+			return Conflict{}, ErrRevisionState
+		}
+		for _, object := range plan.Objects {
+			if err := s.objectStorage.Verify(ctx, object); err != nil {
+				return Conflict{}, ErrObjectUnavailable
+			}
+		}
 	}
 	return s.repository.ResolveProfileConflict(
 		ctx, workspaceID, profileID, conflictID, resolution, actorID, s.now().UTC(),

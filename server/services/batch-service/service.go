@@ -63,6 +63,9 @@ const (
 	ErrorCodeCancelled        = "cancelled"
 	ErrorCodeDeadlineExceeded = "deadline_exceeded"
 	ErrorCodeOperationFailed  = "operation_failed"
+	// ErrorCodeNameConflict: the item's name (or account identifier) is
+	// already used by a live resource, possibly an earlier item of the batch.
+	ErrorCodeNameConflict = "name_conflict"
 )
 
 // ItemError is safe for structured transport while retaining the original
@@ -736,6 +739,9 @@ func classifyFailure(err error) *ItemError {
 	case errors.Is(err, proxyservice.ErrAssignmentConflict),
 		errors.Is(err, taskservice.ErrStateConflict):
 		result.Code = ErrorCodeStateConflict
+	case errors.Is(err, browserinstanceservice.ErrNameConflict),
+		errors.Is(err, accountservice.ErrIdentifierConflict):
+		result.Code = ErrorCodeNameConflict
 	case errors.Is(err, accountservice.ErrUnsupported),
 		errors.Is(err, proxyservice.ErrUnsupportedRoute):
 		result.Code = ErrorCodeUnsupported

@@ -21,6 +21,9 @@ var (
 	ErrSecretProvider     = errors.New("proxy secret provider is unavailable")
 	ErrAuthorizer         = errors.New("proxy authorizer is unavailable")
 	ErrUnsupportedRoute   = errors.New("proxy protocol is not supported by connector")
+	// ErrNameConflict: proxy names are unique per workspace among live
+	// proxies, compared case-insensitively.
+	ErrNameConflict = errors.New("proxy name already exists")
 )
 
 type ConnectorType string
@@ -96,16 +99,26 @@ type UpdateInput struct {
 }
 
 type Assignment struct {
-	ID          string     `json:"id"`
-	WorkspaceID string     `json:"workspaceId"`
-	ProxyID     string     `json:"proxyId"`
-	TargetID    string     `json:"targetId"`
-	TargetType  string     `json:"targetType"`
-	Version     int64      `json:"version"`
-	CreatedBy   string     `json:"createdBy,omitempty"`
-	CreatedAt   time.Time  `json:"createdAt"`
-	UpdatedAt   time.Time  `json:"updatedAt"`
-	DeletedAt   *time.Time `json:"deletedAt,omitempty"`
+	ID          string `json:"id"`
+	WorkspaceID string `json:"workspaceId"`
+	ProxyID     string `json:"proxyId"`
+	// ProxyName is the assigned proxy's current name, resolved whenever an
+	// assignment is read so clients need no second lookup. It is not stored
+	// with the assignment and is empty only if the proxy row is missing.
+	ProxyName  string     `json:"proxyName,omitempty"`
+	TargetID   string     `json:"targetId"`
+	TargetType string     `json:"targetType"`
+	Version    int64      `json:"version"`
+	CreatedBy  string     `json:"createdBy,omitempty"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	UpdatedAt  time.Time  `json:"updatedAt"`
+	DeletedAt  *time.Time `json:"deletedAt,omitempty"`
+}
+
+// AssignmentFilter narrows ListAssignments; empty fields match everything.
+type AssignmentFilter struct {
+	ProxyID    string
+	TargetType string
 }
 
 type HealthCheck struct {
@@ -140,7 +153,10 @@ type Repository interface {
 	UpdateProxy(context.Context, Proxy, int64) (Proxy, error)
 	DeleteProxy(context.Context, string, string, int64, time.Time) error
 	CreateProxyAssignment(context.Context, Assignment) (Assignment, error)
-	FindProxyAssignment(context.Context, string, string, string) (Assignment, error)
+	// FindProxyAssignment and ListProxyAssignments return live assignments
+	// with ProxyName resolved.
+	FindProxyAssignment(ctx context.Context, workspaceID, targetID, targetType string) (Assignment, error)
+	ListProxyAssignments(ctx context.Context, workspaceID string, filter AssignmentFilter) ([]Assignment, error)
 	DeleteProxyAssignment(context.Context, string, string, string, int64, time.Time) error
 	CreateProxyHealthCheck(context.Context, HealthCheck) error
 	FindProxyHealthCheck(context.Context, string, string) (HealthCheck, error)
@@ -285,7 +301,8 @@ func (s *Service) Assign(ctx context.Context, actorID, workspaceID, proxyID, tar
 	if err := s.require(ctx, workspaceID, actorID, memberservice.PermissionProxyManage); err != nil {
 		return Assignment{}, err
 	}
-	if _, err := s.repository.FindProxy(ctx, workspaceID, proxyID); err != nil {
+	proxy, err := s.repository.FindProxy(ctx, workspaceID, proxyID)
+	if err != nil {
 		return Assignment{}, err
 	}
 	targetID, targetType = strings.TrimSpace(targetID), strings.ToLower(strings.TrimSpace(targetType))
@@ -293,7 +310,46 @@ func (s *Service) Assign(ctx context.Context, actorID, workspaceID, proxyID, tar
 		return Assignment{}, err
 	}
 	now := s.now().UTC()
-	return s.repository.CreateProxyAssignment(ctx, Assignment{ID: uuid.NewString(), WorkspaceID: workspaceID, ProxyID: proxyID, TargetID: targetID, TargetType: targetType, Version: 1, CreatedBy: actorID, CreatedAt: now, UpdatedAt: now})
+	assignment, err := s.repository.CreateProxyAssignment(ctx, Assignment{ID: uuid.NewString(), WorkspaceID: workspaceID, ProxyID: proxyID, TargetID: targetID, TargetType: targetType, Version: 1, CreatedBy: actorID, CreatedAt: now, UpdatedAt: now})
+	if err != nil {
+		return Assignment{}, err
+	}
+	assignment.ProxyName = proxy.Name
+	return assignment, nil
+}
+
+// GetAssignment returns the live assignment of one target, including the
+// version Unassign requires. Reading needs only proxy.read.
+func (s *Service) GetAssignment(ctx context.Context, actorID, workspaceID, targetType, targetID string) (Assignment, error) {
+	if err := s.require(ctx, workspaceID, actorID, memberservice.PermissionProxyRead); err != nil {
+		return Assignment{}, err
+	}
+	targetID, targetType = strings.TrimSpace(targetID), strings.ToLower(strings.TrimSpace(targetType))
+	if err := validateAssignmentTarget(targetID, targetType); err != nil {
+		return Assignment{}, err
+	}
+	return s.repository.FindProxyAssignment(ctx, strings.TrimSpace(workspaceID), targetID, targetType)
+}
+
+// ListAssignments returns the workspace's live assignments, optionally only
+// those of one proxy or one target type.
+func (s *Service) ListAssignments(ctx context.Context, actorID, workspaceID string, filter AssignmentFilter) ([]Assignment, error) {
+	if err := s.require(ctx, workspaceID, actorID, memberservice.PermissionProxyRead); err != nil {
+		return nil, err
+	}
+	filter.ProxyID = strings.TrimSpace(filter.ProxyID)
+	if filter.ProxyID != "" {
+		if _, err := uuid.Parse(filter.ProxyID); err != nil {
+			return nil, errors.New("proxyId must be a UUID")
+		}
+	}
+	filter.TargetType = strings.ToLower(strings.TrimSpace(filter.TargetType))
+	switch filter.TargetType {
+	case "", "account", "profile", "browser_instance":
+	default:
+		return nil, errors.New("targetType must be account, profile, or browser_instance")
+	}
+	return s.repository.ListProxyAssignments(ctx, strings.TrimSpace(workspaceID), filter)
 }
 
 // AssignProxy is the explicit name used by API adapters; Assign remains the

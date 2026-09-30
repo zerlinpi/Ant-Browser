@@ -32,6 +32,9 @@ func (s *Store) CreateAccount(ctx context.Context, account accountservice.Accoun
 		account.ExternalID, account.Username, account.Email, account.Region, account.ProfileID,
 		account.BrowserInstanceID, account.Status, account.RiskLevel, account.Notes, metadata,
 		account.Version, account.CreatedBy, account.CreatedAt, account.UpdatedAt)
+	if isUniqueViolationOn(err, accountIdentifierIndex) {
+		return accountservice.ErrIdentifierConflict
+	}
 	if isUniqueViolation(err) {
 		return accountservice.ErrVersionConflict
 	}
@@ -76,6 +79,12 @@ func (s *Store) UpdateAccount(ctx context.Context, account accountservice.Accoun
 		account.ID, account.WorkspaceID, expectedVersion, account.Identifier, account.Name,
 		account.ExternalID, account.Username, account.Email, account.Region, account.ProfileID,
 		account.BrowserInstanceID, account.Status, account.RiskLevel, account.Notes, metadata, account.UpdatedAt)
+	if isUniqueViolationOn(err, accountIdentifierIndex) {
+		return accountservice.Account{}, accountservice.ErrIdentifierConflict
+	}
+	if isForeignKeyViolation(err) {
+		return accountservice.Account{}, accountservice.ErrNotFound
+	}
 	if err != nil {
 		return accountservice.Account{}, err
 	}

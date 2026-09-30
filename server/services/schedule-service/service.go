@@ -17,7 +17,12 @@ var (
 	ErrNotFound        = errors.New("schedule not found")
 	ErrVersionConflict = errors.New("schedule version conflict")
 	ErrStateConflict   = errors.New("schedule state conflict")
+	ErrInvalidTimezone = errors.New("timezone must be a valid IANA timezone")
 )
+
+// enableAttempts bounds the optimistic retries of Enable/Disable, which take
+// no client version: a concurrent edit or dispatch only forces a re-read.
+const enableAttempts = 3
 
 type Schedule struct {
 	ID                string     `json:"id"`
@@ -58,7 +63,10 @@ type Repository interface {
 	ListSchedules(context.Context, string) ([]Schedule, error)
 	UpdateSchedule(context.Context, Schedule, int64, time.Time) (Schedule, error)
 	DeleteSchedule(context.Context, string, string) error
-	SetScheduleEnabled(context.Context, string, string, bool, time.Time) (Schedule, error)
+	// SetScheduleEnabled sets the enabled flag and status (active or paused)
+	// and replaces next_run_at, but only while the schedule still has
+	// expectedVersion; otherwise it returns ErrVersionConflict.
+	SetScheduleEnabled(ctx context.Context, workspaceID, scheduleID string, enabled bool, nextRunAt *time.Time, expectedVersion int64, now time.Time) (Schedule, error)
 }
 type Dispatch struct {
 	Schedule Schedule
@@ -110,9 +118,9 @@ func (s *Service) validate(ctx context.Context, actor, workspace string, input C
 	if input.Timezone == "" {
 		input.Timezone = "UTC"
 	}
-	location, err := time.LoadLocation(input.Timezone)
+	location, err := loadTimezone(input.Timezone)
 	if err != nil {
-		return input, nil, errors.New("timezone must be a valid IANA timezone")
+		return input, nil, err
 	}
 	if s.workflows != nil {
 		workflow, err := s.workflows.FindWorkflow(ctx, workspace, input.WorkflowID)
@@ -200,7 +208,12 @@ func (s *Service) Update(ctx context.Context, actor, workspace, id string, input
 	}
 	current.CronExpression = normalized.CronExpression
 	current.Timezone = normalized.Timezone
-	current.NextRunAt = &next
+	// A paused schedule has no next run; Enable computes one from the rule
+	// saved here, so a validation error still surfaces now.
+	current.NextRunAt = nil
+	if current.Enabled {
+		current.NextRunAt = &next
+	}
 	current.UpdatedAt = now
 	return s.repository.UpdateSchedule(ctx, current, input.ExpectedVersion, now)
 }
@@ -216,9 +229,64 @@ func (s *Service) Enable(ctx context.Context, actor, workspace, id string) (Sche
 func (s *Service) Disable(ctx context.Context, actor, workspace, id string) (Schedule, error) {
 	return s.setEnabled(ctx, actor, workspace, id, false)
 }
+
+// setEnabled pauses or resumes a schedule. Resuming, including recovering a
+// schedule in error, computes the first occurrence after now: runs missed
+// while paused are skipped rather than fired immediately with a stale time.
+// An already active schedule keeps its pending next run.
 func (s *Service) setEnabled(ctx context.Context, actor, workspace, id string, enabled bool) (Schedule, error) {
 	if err := s.authorize(ctx, actor, workspace, memberservice.PermissionWorkflowManage); err != nil {
 		return Schedule{}, err
 	}
-	return s.repository.SetScheduleEnabled(ctx, workspace, id, enabled, s.now().UTC())
+	for attempt := 1; ; attempt++ {
+		current, err := s.repository.FindSchedule(ctx, workspace, id)
+		if err != nil {
+			return Schedule{}, err
+		}
+		now := s.now().UTC()
+		var next *time.Time
+		if enabled {
+			if current.Enabled && current.Status == "active" && current.NextRunAt != nil {
+				next = current.NextRunAt
+			} else {
+				computed, err := nextRun(current.CronExpression, current.Timezone, now)
+				if err != nil {
+					return Schedule{}, err
+				}
+				next = &computed
+			}
+		}
+		updated, err := s.repository.SetScheduleEnabled(ctx, workspace, id, enabled, next, current.Version, now)
+		if errors.Is(err, ErrVersionConflict) && attempt < enableAttempts {
+			continue
+		}
+		return updated, err
+	}
+}
+
+func nextRun(expression, timezone string, after time.Time) (time.Time, error) {
+	cron, err := ParseCron(expression)
+	if err != nil {
+		return time.Time{}, err
+	}
+	location, err := loadTimezone(timezone)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return cron.Next(after, location)
+}
+
+// loadTimezone accepts IANA names only. time.LoadLocation also maps "" to
+// UTC and "Local" to the process timezone, which would make a schedule
+// depend on the host it happens to run on.
+func loadTimezone(name string) (*time.Location, error) {
+	name = strings.TrimSpace(name)
+	if name == "" || name == "Local" {
+		return nil, ErrInvalidTimezone
+	}
+	location, err := time.LoadLocation(name)
+	if err != nil {
+		return nil, ErrInvalidTimezone
+	}
+	return location, nil
 }

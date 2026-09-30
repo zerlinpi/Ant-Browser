@@ -4,6 +4,7 @@ import type { NotificationItem } from "@/types";
 interface SocketTicket {
   ticket: string;
   expiresAt?: string;
+  subprotocol: string;
 }
 
 export class NotificationChannel {
@@ -22,18 +23,24 @@ export class NotificationChannel {
     this.closed = false;
     window.clearTimeout(this.retryTimer);
     try {
-      const { ticket } = await api.post<SocketTicket>(`/api/v1/workspaces/${this.workspaceId}/notifications/socket-ticket`);
+      const { ticket, subprotocol } = await api.post<SocketTicket>(`/api/v1/workspaces/${this.workspaceId}/notifications/socket-ticket`);
+      if (!ticket || !subprotocol) throw new Error("Notification socket ticket response is incomplete");
+      if (this.closed) return;
       const url = new URL("/api/v1/notifications/ws", this.apiBaseURL);
       url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-      const socket = new WebSocket(url, ["ant-browser.notification.v1", ticket]);
+      const socket = new WebSocket(url, [subprotocol, `ant-browser-ticket.${ticket}`]);
       this.socket = socket;
       socket.onopen = () => { this.retryDelay = 1_000; };
       socket.onmessage = (event) => {
         try {
-          const envelope = JSON.parse(String(event.data));
-          this.onMessage((envelope.data ?? envelope) as NotificationItem);
+          const envelope = JSON.parse(String(event.data)) as { type?: unknown; data?: unknown };
+          if (envelope.type !== "notification.created" || !envelope.data || typeof envelope.data !== "object") return;
+          const item = envelope.data as Partial<NotificationItem>;
+          if (typeof item.id !== "string" || typeof item.eventType !== "string" ||
+              typeof item.title !== "string" || typeof item.body !== "string" || typeof item.createdAt !== "string") return;
+          this.onMessage(item as NotificationItem);
         } catch {
-          // Ignore malformed third-party frames; the server only sends JSON.
+          // Ignore malformed and non-notification frames (including hello).
         }
       };
       socket.onclose = () => this.scheduleReconnect();
